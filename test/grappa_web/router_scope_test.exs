@@ -133,6 +133,13 @@ defmodule GrappaWeb.RouterScopeTest do
     {"POST", "/auth/passkeys/second-factor"},
     {"POST", "/auth/passkeys/recover"},
     {"POST", "/auth/share/consume"},
+    # #1911 — both legs of the OIDC browser round trip. Unauthenticated by
+    # design: `authorize` mints the credential question and `callback` is
+    # the provider answering it, the position `POST /auth/login` holds for
+    # the password. GETs, so they must be named here or the drive below
+    # refuses a door that never reads a bearer.
+    {"GET", "/auth/oidc/authorize"},
+    {"GET", "/auth/oidc/callback"},
     {"GET", "/push/vapid-public-key"},
     {"GET", "/api/config"},
     {"GET", "/uploads/:slug"},

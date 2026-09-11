@@ -54137,3 +54137,107 @@ quote precisely because it is one. Colour only: muted, never hidden.
 - Out of scope, as the issue says: turning the reply into a structured field
   with its own wire representation. This is a colour on a region that was
   already identified.
+<!-- entry #1911 -->
+
+---
+
+## 2026-09-11 — issue 1911: OIDC login for grappa/cicchetto, and the one wire shape it did register
+
+The door is `GET /auth/oidc/authorize` + `GET /auth/oidc/callback`, generic
+OIDC discovery + authorization code + PKCE (S256), against ONE
+operator-configured provider: `GRAPPA_OIDC_{ISSUER,CLIENT_ID,CLIENT_SECRET,REDIRECT_URI,SCOPES}`
+→ `runtime.exs` → `:grappa, :oidc` → `Grappa.Auth.Oidc.Config.boot/0` →
+`:persistent_term`, the `Grappa.Admission.Config` seam. An unset `:issuer` is
+the OFF state and every route answers a bare 404 — which is also how cic
+discovers the door: `fetch(…, {redirect: "manual"})` and a `opaqueredirect`/302
+means present. A browser cannot read a `Location` across a redirect, so the
+probe reads status and response type and nothing else; that is also why
+`beginOidcLogin` does `window.location.assign("/auth/oidc/authorize")` instead
+of fetching the route.
+
+Endpoints are never operator-named. The discovery document is read from
+`<issuer>/.well-known/openid-configuration` (`Grappa.Auth.Oidc.Discovery`,
+HTTPS only, issuer compared against the URL it was fetched from) and the token
+endpoint is taken from it, so a config typo cannot point the client secret at a
+look-alike host.
+
+### Identity is the `id_token`, and only the `id_token`
+
+`Grappa.Auth.Oidc.IdToken` verifies it against the provider's JWKS keyed by the
+header `kid`, under `JOSE.JWT.verify_strict/3` with an asymmetric-only
+algorithm allowlist — no `HS*` at all, because the client secret is a
+token-endpoint credential and admitting a shared-secret algorithm is the
+algorithm-confusion forgery `verify_strict` exists to close. Then the OIDC Core
+§3.1.3.7 claim set: `iss` against the CONFIGURED issuer, `aud`/`azp` against
+this client, `exp`/`nbf` at 60 s leeway, `nonce` by `Plug.Crypto.secure_compare`,
+`sub` non-empty. The access token that travels beside it is discarded unread and
+there is no userinfo fetch: an identifier taken from userinfo would need
+exactly these checks to be trustworthy, so the round trip buys nothing and owes
+a second request.
+
+### No auto-provisioning
+
+An `(issuer, subject)` nobody linked is refused `not_linked`, not provisioned.
+Linking happens only through `POST /me/oidc/link` from a live full session, and
+that action mints the round trip with the `user_id` already inside the
+transaction — the callback has no way to be re-pointed at another account. The
+reason is the whole point of the feature: the operator's account list stays the
+authority and the provider becomes a second way to authenticate an EXISTING
+account, not a way to create one. A JIT door would hand registration to whoever
+the provider vouches for.
+
+The provider's assertion does not waive the account's local second factor
+either. `Grappa.Accounts.Login.second_factor/1` — the same ladder
+`POST /auth/login` descends — sits between a verified token and a minted
+session: TOTP hand-cuffs into a `kind: "totp"` landing via
+`AuthController.second_factor_challenge/2` (reused, not copied), and an
+account whose only factor is a passkey is refused
+`second_factor_unsupported` rather than silently logged in.
+
+### `state`, and why the verifier never rides in it
+
+#1395's `Phoenix.Token` binding, one field wider: `{ip, client_id, txn_id}`.
+The id names a server-side one-shot store (`Grappa.Auth.Oidc.Transaction`,
+modelled on `Accounts.WebAuthnChallengeStore` — same TTL, same sweep, same
+take-consumes-it) holding the PKCE verifier. `Phoenix.Token` is a SIGNATURE,
+not an envelope, and `state` lands in the provider's access log — a verifier
+inside it would be handed to the party PKCE exists to defeat. The single-use
+take also closes the replay the signature cannot: a captured `state` cannot be
+spent twice.
+
+### The wire: one shape registered, the rest recorded as debt
+
+`:oidc_login` joined `Grappa.AdminEvents.Wire.login_throttle_door()` and the
+protocol moved 18 → 19 (the branch forked at 16; #2046 and #1480 took 17 and
+18 while it was out). This is the first time the #1393d additivity ruling
+fired on an ENUM MEMBER, and it is worth recording why the bump is right: the
+union is closed on the cic side (`ADMIN_EVENTS_WIRE_LOGIN_THROTTLE_DOOR` is
+generated), so the member is a real shape change even though the server
+emission is additive; and the door would have been MUTE without it — the house
+rule is that a credential door charges through `GrappaWeb.LoginThrottle.charge/4`,
+which is what turns the window-crossing charge into `login_throttled` for the
+operator's Events tab. A door charged by a bare `FailureWindow.record_failure/3`
+shuts in silence.
+
+The debt is the landing. Every outcome of the callback reaches cic as
+`/login#oidc=` + base64url JSON (`session` / `totp` / `linked` / `error`),
+built with an inline `Jason.encode!` and a redirect — there is no
+`GrappaWeb.*JSON` view, so `mix grappa.wire_pin` digests nothing and these
+shapes could drift with the gate green. They are deliberately NOT registered in
+this slice: producer and consumer ship together in this repo, and #1911's
+browser flow has exactly one client. The moment a third party can be handed
+these fragments the registration becomes load-bearing. Until then the only
+guard on the shape is cic's codec (`cicchetto/src/lib/oidc.ts`), which narrows
+every arm and refuses a malformed or unknown one — pinned by
+`__tests__/oidc.test.ts`.
+
+### What was not done
+
+No RP-initiated logout (the session is a local bearer; killing it is
+`DELETE /auth/logout`'s job and the provider session is the provider's), no
+multi-provider list, no token storage of any kind, and no live Kanidm
+acceptance run — no provider was reachable from the dev container, so the
+conformance claim rests on the spec-mandated checks above plus the Bypass-driven
+round trip in `test/grappa_web/controllers/oidc_controller_test.exs`. The
+acceptance pass against a real Kanidm is owed before this ships to a deploy
+that turns the door on.

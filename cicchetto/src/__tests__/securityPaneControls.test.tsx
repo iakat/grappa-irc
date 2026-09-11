@@ -19,6 +19,9 @@ const api = vi.hoisted(() => ({
   getPasskeyStatus: vi.fn(),
   getTotpStatus: vi.fn(),
   startTotpEnrollment: vi.fn(),
+  getOidcIdentity: vi.fn(),
+  startOidcLink: vi.fn(),
+  unlinkOidc: vi.fn(),
 }));
 
 vi.mock("../lib/api", () => ({
@@ -30,6 +33,12 @@ vi.mock("../lib/api", () => ({
   finishPasskeyRegistration: vi.fn(),
   getPasskeyStatus: api.getPasskeyStatus,
   getTotpStatus: api.getTotpStatus,
+  // #1911 — the provider link joined the same security subpage, so its
+  // three verbs are mocked here too. The default answer is "nothing
+  // linked", which is the state the #734/#735 assertions are about.
+  getOidcIdentity: api.getOidcIdentity,
+  startOidcLink: api.startOidcLink,
+  unlinkOidc: api.unlinkOidc,
   preparePasswordless: vi.fn(),
   startPasskeyModeChange: vi.fn(),
   startPasskeyRegistration: vi.fn(),
@@ -70,6 +79,7 @@ describe("#734 TOTP enrolment QR sits in a sized, light-framed box", () => {
   it("the enrolment QR container asks for the sized frame class", async () => {
     api.getTotpStatus.mockResolvedValue({ enabled: false });
     api.getPasskeyStatus.mockResolvedValue({ mode: "disabled", passkeys: [] });
+    api.getOidcIdentity.mockResolvedValue(null);
     api.startTotpEnrollment.mockResolvedValue({
       enrollment_token: "enrol-token",
       provisioning_uri: "otpauth://totp/grappa:vjt?secret=ABCD",
