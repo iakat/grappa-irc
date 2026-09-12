@@ -1,0 +1,77 @@
+// M6 — cicchetto-driven PRIVMSG to a nick (DM): /msg target body opens
+// the query window, switches focus, and renders the own-msg.
+//
+// Manual matrix: vjt types `/msg <nick> <body>` in the active
+// compose. Expected:
+//   - DM persists server-side at channel = <target>
+//   - query window for <target> appears in sidebar (auto-opened by
+//     compose.ts's /msg handler via openQueryWindowState)
+//   - cicchetto auto-focuses the new query window
+//   - own message renders in that window's scrollback
+//   - no msg-unread badge (focused)
+//
+// A peer is online to act as the DM target — without a present nick,
+// the leaf would NOTICE back "no such nick" and grappa would not
+// persist a DM row (msg goes to leaf which rejects, no echo). The
+// peer is otherwise silent: this is a cicchetto-only assertion, the peer's
+// inbound side is M5's job.
+//
+// Page-object's selectChannel helper isn't used to switch to the DM
+// window — `/msg` does that automatically inside compose.ts. We just
+// wait for the query window's sidebar entry to appear after submit.
+import { composeSend, loginAs, scrollbackLine, selectChannel, sidebarMessageBadge, sidebarWindow, waitForDmListenerReady, } from "../fixtures/cicchettoPage";
+import { assertMessagePersisted } from "../fixtures/grappaApi";
+import { IrcPeer } from "../fixtures/ircClient";
+import { AUTOJOIN_CHANNELS, NETWORK_SLUG } from "../fixtures/seedData";
+import { expect, specNick, specUser, test } from "../fixtures/test";
+const PEER_NICK = "m6-peer";
+const CHANNEL = AUTOJOIN_CHANNELS[0];
+const MESSAGE_BODY = "M6: cicchetto-driven DM outbound";
+test("M6 — cicchetto /msg opens query window, focuses, renders own-msg", async ({ page }) => {
+    const vjt = specUser();
+    await loginAs(page, vjt);
+    // Start in a real channel so the compose box is visible (Server
+    // window has no compose). selectChannel + ownNick syncs WS-ready
+    // for #spec-wN — same pattern as M1/M2/M7.
+    await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+    await waitForDmListenerReady(page, NETWORK_SLUG);
+    // Peer joins the network so the DM target nick is visible to the
+    // leaf. M6 doesn't assert peer-side; the peer is just here to be
+    // a valid recipient. Peer doesn't need to JOIN any channel — DMs
+    // route by nick.
+    const peer = await IrcPeer.connect({ nick: PEER_NICK });
+    try {
+        // /msg auto-opens the query window AND switches focus AND sends
+        // the body. One compose interaction = three DOM consequences.
+        //
+        // The two round-trip assertions below use a 15s budget, not the 5s
+        // default: the /msg → bouncer-persist → WS-push → scrollback-render
+        // round-trip can exceed 5s under full-suite load on a slow host
+        // (observed 7.5s on the Raspberry Pi dev box — same timing flake as
+        // cp15-b6-archive-query-revival; bisected to load, not state). See
+        // DESIGN_NOTES 2026-06-09 "cp15-b6 / m6 e2e timing flake".
+        await composeSend(page, `/msg ${peer.nick} ${MESSAGE_BODY}`);
+        // Sidebar gains an entry for the peer-nick (the DM target).
+        // sidebarWindow scopes by network section, so a hypothetical
+        // PEER_NICK string elsewhere doesn't false-match.
+        await expect(sidebarWindow(page, NETWORK_SLUG, peer.nick)).toHaveCount(1, { timeout: 15_000 });
+        // Server-side: DM row persisted at channel = PEER_NICK with
+        // sender = specNick(). The wire shape mirrors a regular
+        // PRIVMSG row; the channel field is the nick because that's the
+        // PRIVMSG target.
+        await assertMessagePersisted({
+            token: vjt.token,
+            networkSlug: NETWORK_SLUG,
+            channel: peer.nick,
+            sender: specNick(),
+            body: MESSAGE_BODY,
+        });
+        // DOM: own DM row in the now-focused query window scrollback.
+        await expect(scrollbackLine(page, "privmsg", MESSAGE_BODY)).toBeVisible({ timeout: 15_000 });
+        // Focused query window: no unread bump on own send.
+        await expect(sidebarMessageBadge(page, NETWORK_SLUG, peer.nick)).toHaveCount(0);
+    }
+    finally {
+        await peer.disconnect("M6 done");
+    }
+});

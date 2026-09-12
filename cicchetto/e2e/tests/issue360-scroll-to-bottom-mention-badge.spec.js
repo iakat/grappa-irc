@@ -1,0 +1,289 @@
+// #360 — the floating scroll-to-bottom button (C7.4, `ScrollbackPane`) is
+// mention-aware. When own-nick mentions sit BELOW the current viewport in the
+// active window the button shows a numeric BADGE = how many. Tapping it then
+// SMOOTH-scrolls to the nearest mention below (nearest-first, cycling down),
+// decrementing the badge each tap as the target clears past the fold; once
+// none remain (badge gone) a tap behaves as before — snap to the newest line.
+//
+// Why a REAL browser e2e (not vitest): the badge is DERIVED from live layout
+// geometry (offsetTop per row vs the scroll container's viewport bottom), and
+// the tap performs a native smooth `scrollIntoView`. jsdom reports 0 for every
+// geometry and animates nothing, so the below-the-fold DECISION is unit-tested
+// as a pure fn (`lib/mentionScroll.test.ts`) and THIS spec pins the DOM→badge→
+// scroll wiring against a chromium engine. The smooth-scroll FEEL is vjt
+// device-verified on prod (Playwright ≠ iOS); the count + jump LOGIC is here.
+//
+// Isolation: a FRESH per-run channel (`#i360m-<ts>`) — #bofh accumulates
+// mentions from other specs (#280 leaves `vjt-grappa: 280 ping` behind), which
+// would make an EXACT badge-count assertion non-deterministic. The fresh
+// channel starts empty + mention-free, so the two seeded mentions are the only
+// ones the badge can count. Cleaned up (peer quit + operator PART) in finally.
+//
+// Chromium only: the gesture is the floating button (identical element on
+// desktop + mobile) and the logic is layout-driven, so this rides the
+// scroll-geometry-spec precedent (#168, #243, #280-coexist) which pins
+// geometry on one engine rather than the user-class parity matrix.
+import { loginAs, scrollbackDistanceFromBottom, scrollbackLine, scrollbackLines, selectChannel, } from "../fixtures/cicchettoPage";
+import { assertMessagePersisted, partChannel } from "../fixtures/grappaApi";
+import { IrcPeer } from "../fixtures/ircClient";
+import { forwardPageDiagnostics } from "../fixtures/pageDiagnostics";
+import { AUTOJOIN_CHANNELS, NETWORK_SLUG } from "../fixtures/seedData";
+import { expect, specNick, specUser, test } from "../fixtures/test";
+const SCROLL_BOTTOM_THRESHOLD_PX = 50;
+const SCROLL_TO_BOTTOM = '[data-testid="scroll-to-bottom"]';
+const BADGE = '[data-testid="scroll-to-bottom-badge"]';
+// Desktop (width > 768px, the mobile breakpoint; height > 500px, above the
+// #319 landscape-compact tier) but narrow — the sidebar + members pane leave a
+// scroll pane a few hundred px wide, so one filler wraps to a block tall enough
+// that a couple of them overflow the fold, keeping the peer message count tiny
+// (fewer sends = no flood; see PACE_MS). Deliberately no px figure for that
+// block: it depends on the runner's font metrics, this comment used to guess
+// ~250px while the buffer comment below guessed ~140px, and #903 was the bill
+// for reasoning about margins in numbers nobody had measured.
+test.use({ viewport: { width: 900, height: 560 } });
+// ~270-char body → wraps to a tall (~7-line) block at this pane width, WITHOUT
+// exceeding the IRC line limit: a longer body makes irc-framework SPLIT the
+// PRIVMSG into two wire lines (the overflow lands as a separate "padding…"
+// message AND doubles the send rate → bahamut Excess-Flood kills the peer).
+// Deliberately free of the own nick so a filler is never itself a mention.
+const filler = (i) => `i360 filler ${i} — ${"padding ".repeat(32)}`.slice(0, 280);
+// Functions, not consts: the own-nick is per-test (#1078), so it
+// cannot be read at module load.
+const mention1 = () => `${specNick()}: first ping i360 mention one`;
+const mention2 = () => `${specNick()}: second ping i360 mention two`;
+// Buffer, oldest → newest. LEADING pushes mention1() below the fold at
+// scroll-top; MIDDLE separates the two mentions by more than half the pane so
+// centering the first leaves the second below the fold; TRAILING keeps the pane
+// off the tail after the second jump (button stays up) and leaves travel for
+// the final snap.
+//
+// #903 — TRAILING is NOT a round number, it is the one constant this spec's
+// premise rests on, and it was wrong. The jump anchors on the message AFTER the
+// mention (#360 iOS, b208eebd), so what separates the resting centre from the
+// tail is TRAILING-1 fillers, not TRAILING — and that commit never revisited
+// this block. Measured from the failing run's trace (31046232909): after tap 2
+// the pane rested at scrollTop 941 against a tail of 945. FOUR pixels, against
+// a 50px threshold — so the button unmounted because the pane really was at the
+// bottom, and the "button remains" assertion below was asserting something
+// false. Not a race, and nothing to tolerate.
+//
+// Each added filler pushes the resting position a further ~1 filler off the
+// tail (the anchor does not move; only the tail does), so TRAILING 2 → 4 buys
+// roughly two filler-heights of margin over the threshold instead of 4px. The
+// filler's rendered height is the thing that varies per runner — this file used
+// to estimate it at ~250px in one comment and ~140px in another, which is
+// exactly the uncertainty that made the old margin a coin toss — so the margin
+// is sized in FILLERS, a unit that scales with whatever that height turns out
+// to be, rather than in pixels. Cost is 2 more paced sends (~4.4s) inside the
+// 25-minute integration CI ceiling. `expectSettledNotAtBottom` asserts the
+// premise outright, so if this ever drifts again the red says so with a number.
+const LEADING = 4;
+const MIDDLE = 2;
+const TRAILING = 4;
+const LAST_FILLER_IDX = LEADING + MIDDLE + TRAILING - 1;
+// Short unique prefix of the last filler — a 380-char `hasText` is brittle
+// under Playwright whitespace normalisation; this token pins the tail line.
+const LAST_FILLER_TOKEN = `i360 filler ${LAST_FILLER_IDX} `;
+// Pace peer PRIVMSGs to defeat bahamut's fake-lag flood protection WITHOUT
+// wasting CI minutes. Each PRIVMSG accrues a ~2s penalty that drains at ~1s
+// wall-clock; the connection is dropped once the accrued penalty exceeds ~10s
+// (proven: an unpaced dozen dies at ~msg 9). So the FIRST `FLOOD_SAFE_BURST`
+// lines go out instantly (staying under the ~10s bank), and only the remainder
+// is paced AT the penalty rate (net-flat, immune regardless of count). This is
+// deliberate outbound rate-limiting, not a wait-for-state sleep.
+const FLOOD_SAFE_BURST = 3;
+const PACE_MS = 2_200;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Scroll to the very top + fire a synthetic scroll so the Solid onScroll
+// handler runs (recomputes the badge + flips atBottom). Fresh channel ⇒
+// loadMore finds no older history and is a no-op. Mirrors #243/#280.
+async function scrollToTop(page) {
+    await page.evaluate(() => {
+        const el = document.querySelector('[data-testid="scrollback"]');
+        el.scrollTop = 0;
+        el.dispatchEvent(new Event("scroll"));
+    });
+}
+// #903 — the pane's RESTING geometry, then the button. The button renders
+// under `<Show when={!atBottomNow()}>` and `atBottomNow` is DERIVED from
+// `scrollHeight - scrollTop - clientHeight` read in onScroll, so "the button is
+// there" is really a claim about where the pane came to rest. Checking the
+// premise separately makes a red name which half broke: the distance assertion
+// failing means the pane genuinely landed within the threshold (the buffer's
+// margin below the jump target is too thin — a fixture problem), while it
+// passing with the button still absent means the signal disagrees with the
+// settled geometry (a product problem — onScroll clears `atBottomNow` only when
+// scrollTop DECREASES, so a true reading taken mid-jump is never revised on the
+// way down). A bare "element(s) not found" distinguishes neither.
+//
+// The idle wait is a CONDITION, not a delay: two consecutive reads with an
+// identical scrollTop mean the smooth jump has stopped moving. It cannot be
+// spelled `expect.poll(distance).toBeGreaterThan(...)` — that succeeds on the
+// FIRST satisfying read, which during a downward jump is the first one taken,
+// constraining nothing about the resting position it is supposed to pin.
+async function expectSettledNotAtBottom(page) {
+    let prev = null;
+    await expect
+        .poll(async () => {
+        const top = await page.evaluate(() => {
+            const el = document.querySelector('[data-testid="scrollback"]');
+            return el === null ? null : Math.round(el.scrollTop);
+        });
+        const settled = top !== null && top === prev;
+        prev = top;
+        return settled;
+    }, { timeout: 10_000 })
+        .toBe(true);
+    expect((await scrollbackDistanceFromBottom(page)) ?? 0, "the pane must come to rest above the at-bottom threshold, or the button is right to be gone").toBeGreaterThan(SCROLL_BOTTOM_THRESHOLD_PX);
+}
+// True when the scrollback line whose body contains `needle` is fully within
+// the scroll container's visible box (the jump target landed in view). Read
+// against the CONTAINER rect (not the browser viewport) so an off-fold line
+// clipped by overflow reads as NOT visible.
+async function lineVisibleInPane(page, needle) {
+    return await page.evaluate((text) => {
+        const pane = document.querySelector('[data-testid="scrollback"]');
+        if (!pane)
+            return false;
+        const paneRect = pane.getBoundingClientRect();
+        const lines = Array.from(pane.querySelectorAll('[data-testid="scrollback-line"]'));
+        const el = lines.find((l) => (l.textContent ?? "").includes(text));
+        if (!el)
+            return false;
+        const r = el.getBoundingClientRect();
+        return r.top >= paneRect.top - 1 && r.bottom <= paneRect.bottom + 1;
+    }, needle);
+}
+// #653/#639 — tap the floating scroll-to-bottom button, tolerating the
+// snap-to-bottom unmount race. The button lives under `<Show when=
+// {!atBottomNow()}>` (ScrollbackPane), so it UNMOUNTS the instant the pane
+// reaches bottom. On the empty-badge tap a settling scroll from the prior
+// jump can flip `atBottomNow` true BETWEEN the visibility check and this
+// click — Playwright resolves the button, the node detaches mid-click, and
+// its built-in detach-retry then waits out the full 10s for a node that will
+// never remount. Re-resolve per attempt and treat an already-unmounted button
+// as the snap having landed (button gone == at bottom == the tap's own goal);
+// the post-tap assertions at the call site stay the source of truth for the
+// end state, so an early return can never mask a wrong one — a button that
+// vanished WITHOUT reaching bottom fails the distance-from-bottom poll below.
+async function tapScrollToBottom(page, selector) {
+    const btn = page.locator(selector);
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+        if ((await btn.count()) === 0)
+            return;
+        try {
+            await btn.click({ timeout: 1_500 });
+            return;
+        }
+        catch (err) {
+            if ((await btn.count()) === 0)
+                return;
+            if (Date.now() >= deadline)
+                throw err;
+        }
+    }
+}
+test.describe("#360 — mention-aware scroll-to-bottom badge", () => {
+    test("badge counts mentions below the fold; tap jumps to the next mention, decrementing; empty-badge tap snaps to bottom", async ({ page, }) => {
+        // Paced peer sends + several condition-polled assertions — well past
+        // Playwright's 30s default.
+        test.setTimeout(150_000);
+        // Surface cic console errors / uncaught page errors so a wiring regression
+        // (e.g. the badge signal throwing) is legible in the run log.
+        forwardPageDiagnostics(page);
+        const vjt = specUser();
+        const channel = `#i360m-${Date.now() % 100000}`;
+        const peerNick = `i360peer-${Date.now() % 100000}`;
+        await loginAs(page, vjt);
+        // Stable base — the seeded autojoin window is live + focused first.
+        await selectChannel(page, NETWORK_SLUG, AUTOJOIN_CHANNELS[0], { ownNick: specNick() });
+        const peer = await IrcPeer.connect({ nick: peerNick });
+        try {
+            await peer.join(channel);
+            // Operator joins so the mentions route to their session + window, then
+            // focuses it EMPTY: peer traffic arriving while focused is "live read"
+            // (no unread-marker divider to fight the scroll geometry).
+            await page.locator(".compose-box textarea").fill(`/join ${channel}`);
+            await page.locator(".compose-box textarea").press("Enter");
+            await selectChannel(page, NETWORK_SLUG, channel, { ownNick: specNick() });
+            // Seed the buffer, oldest → newest — burst-then-pace (see FLOOD_SAFE_BURST).
+            const buffer = [];
+            for (let i = 0; i < LEADING; i++)
+                buffer.push(filler(i));
+            buffer.push(mention1());
+            for (let i = 0; i < MIDDLE; i++)
+                buffer.push(filler(LEADING + i));
+            buffer.push(mention2());
+            for (let i = 0; i < TRAILING; i++)
+                buffer.push(filler(LEADING + MIDDLE + i));
+            for (let i = 0; i < buffer.length; i++) {
+                if (i >= FLOOD_SAFE_BURST)
+                    await sleep(PACE_MS);
+                peer.privmsg(channel, buffer[i]);
+            }
+            // Confirm the burst persisted server-side. The peer sends on ONE ordered
+            // TCP connection, so the LAST filler landing implies every line before it
+            // (both mentions) landed too — one check, not N.
+            await assertMessagePersisted({
+                token: vjt.token,
+                networkSlug: NETWORK_SLUG,
+                channel,
+                sender: peerNick,
+                body: filler(LAST_FILLER_IDX),
+                timeoutMs: 20_000,
+            });
+            // …and rendered in cic (the last line present ⇒ the buffer is complete).
+            await expect(scrollbackLine(page, "privmsg", LAST_FILLER_TOKEN)).toBeVisible({
+                timeout: 15_000,
+            });
+            await expect
+                .poll(async () => await scrollbackLines(page).count(), { timeout: 10_000 })
+                .toBeGreaterThanOrEqual(LEADING + MIDDLE + TRAILING + 2);
+            // Scroll to the top → both mentions are now below the fold.
+            await scrollToTop(page);
+            // Precondition: scrolled up, the floating button shows, and the badge
+            // counts BOTH mentions below the fold.
+            await expectSettledNotAtBottom(page);
+            await expect(page.locator(SCROLL_TO_BOTTOM)).toBeVisible({ timeout: 5_000 });
+            await expect(page.locator(BADGE)).toHaveText("2", { timeout: 10_000 });
+            // Tap 1 → jump to the NEAREST mention below (mention1()); it lands in view
+            // and the badge drops to the one remaining below.
+            await page.locator(SCROLL_TO_BOTTOM).click({ timeout: 10_000 });
+            await expect
+                .poll(async () => await lineVisibleInPane(page, mention1()), { timeout: 8_000 })
+                .toBe(true);
+            await expect(page.locator(BADGE)).toHaveText("1", { timeout: 10_000 });
+            // Still not at bottom → the button stays up for the next jump.
+            await expectSettledNotAtBottom(page);
+            await expect(page.locator(SCROLL_TO_BOTTOM)).toBeVisible();
+            // Tap 2 → jump to mention2(); no mentions remain below → badge gone.
+            await page.locator(SCROLL_TO_BOTTOM).click({ timeout: 10_000 });
+            await expect
+                .poll(async () => await lineVisibleInPane(page, mention2()), { timeout: 8_000 })
+                .toBe(true);
+            await expect(page.locator(BADGE)).toHaveCount(0, { timeout: 10_000 });
+            // Trailing content is still below → the button remains (now a plain
+            // snap-to-bottom affordance). The thinnest margin in the spec: the jump
+            // anchors on the message AFTER the mention (#360 iOS, b208eebd), so only
+            // TRAILING-1 fillers separate the resting centre from the tail.
+            await expectSettledNotAtBottom(page);
+            await expect(page.locator(SCROLL_TO_BOTTOM)).toBeVisible();
+            // Tap 3 (empty badge) → classic snap-to-bottom: newest line, button hides.
+            // Re-resolve-tolerant tap: the button unmounts the instant the snap
+            // reaches bottom, which a settling scroll can trigger mid-click (#653/#639).
+            await tapScrollToBottom(page, SCROLL_TO_BOTTOM);
+            await expect
+                .poll(async () => (await scrollbackDistanceFromBottom(page)) ?? 999, { timeout: 5_000 })
+                .toBeLessThanOrEqual(SCROLL_BOTTOM_THRESHOLD_PX);
+            await expect(page.locator(SCROLL_TO_BOTTOM)).toBeHidden({ timeout: 5_000 });
+        }
+        finally {
+            // The peer may be dead (a QUIT / flood kill closes the socket); the
+            // fixture's disconnect awaits a "close" that then never fires, so cap it
+            // — cleanup must never hang the run.
+            await Promise.race([peer.disconnect("i360 done").catch(() => { }), sleep(3_000)]);
+            await partChannel(vjt.token, NETWORK_SLUG, channel).catch(() => { });
+        }
+    });
+});

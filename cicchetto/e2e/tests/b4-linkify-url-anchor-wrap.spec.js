@@ -1,0 +1,100 @@
+// No-silent-drops B6.4 / B5 HIGH-9 — Playwright coverage for B4
+// (clickable URLs in scrollback / linkify).
+//
+// B4 fix landed in commit 6d09247: ScrollbackPane's mIRC-formatted
+// body splits each text run via lib/linkify.ts and renders URL
+// segments as `<a href target="_blank" rel="noopener noreferrer"
+// class="scrollback-link">`. URL_REGEX matches http(s)/ftp/www
+// prefixes; trailing punctuation (`.`, `,`, `!`, `?`) stays as text;
+// balanced `()` inside the URL are preserved in the href.
+//
+// E2E shape:
+//   1. operator joined to a real channel
+//   2. peer says a body containing a URL with trailing punctuation
+//   3. cic renders the URL as <a class="scrollback-link"> with the
+//      correct href; trailing `.` stays outside the link
+//
+// Per `feedback_cicchetto_browser_smoke`: vitest jsdom can render
+// the DOM but doesn't execute the click + new-tab flow. This e2e
+// pins the DOM shape under a real browser; click semantics are
+// covered by the unit tests in ScrollbackPane.test.tsx.
+import { loginAs, scrollbackLine, selectChannel } from "../fixtures/cicchettoPage";
+import { IrcPeer } from "../fixtures/ircClient";
+import { AUTOJOIN_CHANNELS, NETWORK_SLUG } from "../fixtures/seedData";
+import { expect, specNick, specUser, test } from "../fixtures/test";
+const PEER_NICK = "b4-linker";
+const CHANNEL = AUTOJOIN_CHANNELS[0];
+const URL = "https://example.com";
+const PARENS_URL = "https://en.wikipedia.org/wiki/IRC_(protocol)";
+// GH #212 — a scheme-less `host.tld/path` typed in chat should linkify
+// with an implied https:// href. The bare text carries no scheme.
+const BARE_DOMAIN = "github.com/vjt/grappa-irc/issues/113";
+const BARE_DOMAIN_HREF = `https://${BARE_DOMAIN}`;
+test("B4 — peer URL renders as clickable <a>; trailing '.' stays outside the link", async ({ page, }) => {
+    const vjt = specUser();
+    await loginAs(page, vjt);
+    await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+    const peer = await IrcPeer.connect({ nick: PEER_NICK });
+    try {
+        await peer.join(CHANNEL);
+        peer.privmsg(CHANNEL, `see ${URL}.`);
+        // Wait for the privmsg row to land in scrollback.
+        const row = scrollbackLine(page, "privmsg", URL);
+        await expect(row).toBeVisible({ timeout: 5_000 });
+        // The URL is wrapped in a clickable anchor with target="_blank".
+        const link = row.locator(".scrollback-link").first();
+        await expect(link).toBeVisible();
+        await expect(link).toHaveAttribute("href", URL);
+        await expect(link).toHaveAttribute("target", "_blank");
+        await expect(link).toHaveAttribute("rel", /noopener/);
+        // Trailing `.` is OUTSIDE the link (next to it as text). The
+        // simplest assertion: the row's textContent ends with `.` and
+        // the link's textContent does NOT.
+        await expect(link).toHaveText(URL);
+        await expect(row).toContainText(`${URL}.`);
+    }
+    finally {
+        await peer.disconnect("B4 done");
+    }
+});
+test("B4 — balanced parentheses inside URL are preserved in href", async ({ page }) => {
+    const vjt = specUser();
+    await loginAs(page, vjt);
+    await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+    const peer = await IrcPeer.connect({ nick: `${PEER_NICK}-2` });
+    try {
+        await peer.join(CHANNEL);
+        peer.privmsg(CHANNEL, `read ${PARENS_URL}`);
+        const row = scrollbackLine(page, "privmsg", PARENS_URL);
+        await expect(row).toBeVisible({ timeout: 5_000 });
+        const link = row.locator(".scrollback-link").first();
+        await expect(link).toHaveAttribute("href", PARENS_URL);
+    }
+    finally {
+        await peer.disconnect("B4 parens done");
+    }
+});
+test("#212 — bare host.tld/path renders a clickable anchor with an implied https:// href", async ({ page, }) => {
+    const vjt = specUser();
+    await loginAs(page, vjt);
+    await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+    const peer = await IrcPeer.connect({ nick: `${PEER_NICK}-212` });
+    try {
+        await peer.join(CHANNEL);
+        peer.privmsg(CHANNEL, `bug at ${BARE_DOMAIN}`);
+        const row = scrollbackLine(page, "privmsg", BARE_DOMAIN);
+        await expect(row).toBeVisible({ timeout: 5_000 });
+        // The scheme-less domain is a clickable anchor; the href gains the
+        // implied https:// prefix even though the body text omits it.
+        const link = row.locator(".scrollback-link").first();
+        await expect(link).toBeVisible();
+        await expect(link).toHaveAttribute("href", BARE_DOMAIN_HREF);
+        await expect(link).toHaveAttribute("target", "_blank");
+        await expect(link).toHaveAttribute("rel", /noopener/);
+        // The visible link text stays scheme-less (matches what was typed).
+        await expect(link).toHaveText(BARE_DOMAIN);
+    }
+    finally {
+        await peer.disconnect("#212 done");
+    }
+});

@@ -1206,6 +1206,12 @@ defmodule Grappa.Deploy.PreflightTest do
     # additive `alter table ... add` with a constant default — the same shape
     # as the `add_label_*` / `add_provider_*` entries, and HOT because the
     # classifier says so, not because it was assumed.)
+    # (#1677's `20260822170037_add_tls_verify_to_network_servers` is a plain
+    # additive `alter table ... add` with a constant default — the same shape
+    # as the `add_label_*` / `add_provider_*` entries, and HOT because the
+    # classifier says so, not because it was assumed.)
+    # #1911's `20260911025041_create_oidc_identities` is `create table` +
+    # its unique index and nothing else — additive, no data rewrite.
     @migrations_glob "priv/repo/migrations/*.exs"
     @expected_hot ~w(
       20260425000000_init
@@ -1248,6 +1254,7 @@ defmodule Grappa.Deploy.PreflightTest do
       20260822170037_add_tls_verify_to_network_servers
       20260828230305_add_profile_fields_to_network_credentials
       20260829145052_create_peer_avatars
+      20260911025041_create_oidc_identities
     )
 
     test "every migration on disk classifies, and the HOT set is exactly the pinned one" do

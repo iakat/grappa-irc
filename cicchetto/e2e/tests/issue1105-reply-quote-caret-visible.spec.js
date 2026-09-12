@@ -1,0 +1,129 @@
+import { composeCaretGeometry, composeSend, composeTextarea, expectEndCaretVisible, loginAs, selectChannel, } from "../fixtures/cicchettoPage";
+import { AUTOJOIN_CHANNELS, NETWORK_SLUG } from "../fixtures/seedData";
+import { expect, specNick, specUser, test } from "../fixtures/test";
+test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+test.setTimeout(90_000);
+const CHANNEL = AUTOJOIN_CHANNELS[0];
+// The issue measured the threshold at a 390px viewport: a 46-char quote
+// already wraps and already hides the caret. This body is far past it, so the
+// ROW wraps and the quote it produces is a capped one, while staying well
+// inside one PRIVMSG so the server-side split budget (#246) never turns it
+// into two scrollback rows. #1277 raised the cap to 100 and left the filler
+// alone: the posted body runs 161 code points with the timestamp, still 61
+// past the cap, and the overflow below was measured rather than assumed.
+const FILLER = "che va a capo parecchie volte perche' il textarea e' rows=1 e non cresce, " +
+    "quindi il caret finisce sotto la piega e non si vede piu' nulla";
+// #1235 capped the quoted body plus a literal `...`, so a single reply can no
+// longer BE six wrapped lines: the longest quote the gesture can produce is
+// `<nick> ` + 103 + ` << ` since #1277 raised the cap to 100. The overflow
+// this spec needs is therefore built the way an operator builds it — the reply
+// verb APPENDS, so three replies to the same row stack into a draft that wraps
+// well past the fold, with the caret at the very end of the third. What is
+// measured is unchanged: the caret's geometry after an append.
+//
+// Hardcoded in lockstep with `REPLY_QUOTE_BODY_LIMIT` / `REPLY_QUOTE_ELLIPSIS`
+// in `src/lib/replyQuote.ts`: the house convention is a mirrored constant, so
+// that src VALUES stay out of the e2e runtime graph (fixtures/grappaApi.ts).
+// The e2e package DOES import from `src` — one type-only import, in that same
+// fixture — so "does not import from src", which this comment said until #1646,
+// was false. `QUOTED_BODY_LIMIT` is pinned to the production constant by
+// src/__tests__/e2eConstantMirrors.test.ts; `REPLY_QUOTE_ELLIPSIS` is not
+// mirrored here as a constant and so is not pinned.
+const QUOTED_BODY_LIMIT = 100;
+const QUOTED_ELLIPSIS = "...";
+const REPLIES = 3;
+function cappedQuotedBody(body) {
+    const chars = [...body];
+    return chars.length <= QUOTED_BODY_LIMIT
+        ? body
+        : chars.slice(0, QUOTED_BODY_LIMIT).join("") + QUOTED_ELLIPSIS;
+}
+// Hardcoded in lockstep with `REPLY_QUOTE_TAIL` in `src/lib/replyQuote.ts`, the
+// same convention as the two constants above and for the same reason. The reason
+// is the runtime graph, not the tsconfig: `e2e/tsconfig.json` spans `e2e/` only,
+// but a relative import out of it resolves and typechecks all the same (#1646).
+// Pinned by src/__tests__/e2eConstantMirrors.test.ts.
+const REPLY_QUOTE_TAIL = " << ";
+// What the draft holds after `replies` swipes on the same row. #1357: vjt
+// ruled the compose line accumulates and the marker does NOT repeat, so N
+// replies leave N quotes and ONE tail at the end — `draftBeforeReplyQuote`
+// sheds the marker from a draft that ends with the tail, and the tail's
+// LEADING space is what then separates the two quotes. Derived here once
+// instead of spelled per iteration, so the expectation cannot drift from the
+// rule it claims to state.
+//
+// At `replies === 1` this is character-for-character the pre-#1357 value: the
+// single-reply path is unmoved, which is the acceptance criterion of the
+// ruling and the reason this spec's own subject (caret geometry) is untouched.
+function draftAfterReplies(quoted, replies) {
+    const separator = REPLY_QUOTE_TAIL.slice(0, 1);
+    return Array.from({ length: replies }, () => quoted).join(separator) + REPLY_QUOTE_TAIL;
+}
+// A body unique per run: the e2e sqlite scrollback persists across
+// KEEP_STACK=1 re-runs, and a static string would match two rows on the
+// second run and trip Playwright strict mode.
+function uniqueBody() {
+    return `issue1105 ${Date.now()} ${FILLER}`;
+}
+// Generous slack under what the fixture actually produces: three stacked
+// quotes measure scrollHeight 269 against clientHeight 42 at this viewport,
+// so 227px of overflow (it was 109px under the 42-char cap). Its job is to
+// fail loudly if the fixture ever stops overflowing, because then "the caret
+// is in view" would be true for the wrong reason.
+const MIN_OVERFLOW_PX = 40;
+// A left→right drag on the message row whose text contains `body`. Touch
+// synthesis is per-spec throughout this suite (#123, #308, #1041, #1067, …)
+// because each spec samples something different mid-drag; only the ORACLE is
+// shared. Here nothing mid-drag matters — just that the reply fires.
+async function swipeRowRight(page, body) {
+    await page.evaluate((text) => {
+        const rows = Array.from(document.querySelectorAll('[data-testid="scrollback-line"]'));
+        const row = rows.find((r) => r.textContent?.includes(text));
+        if (row === undefined)
+            throw new Error(`no scrollback row containing ${text}`);
+        const fire = (type, x, y) => {
+            const t = new Touch({ identifier: 1, target: row, clientX: x, clientY: y });
+            const active = type === "touchend" ? [] : [t];
+            row.dispatchEvent(new TouchEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                touches: active,
+                targetTouches: active,
+                changedTouches: [t],
+            }));
+        };
+        // Starts well clear of the left edge: #1041 gave the edge the same
+        // right-swipe (it opens the sidebar), and zone separation is what keeps
+        // one finger from doing both.
+        fire("touchstart", 120, 400);
+        fire("touchmove", 175, 404);
+        fire("touchmove", 235, 407);
+        fire("touchend", 280, 408);
+    }, body);
+}
+test("issue1105 — replying to a wrapping message scrolls the compose caret into view", async ({ page, }) => {
+    if (!CHANNEL)
+        throw new Error("AUTOJOIN_CHANNELS empty");
+    const body = uniqueBody();
+    await loginAs(page, specUser());
+    await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+    await composeSend(page, body);
+    await expect(page.locator('[data-testid="scrollback-line"]', { hasText: body })).toBeVisible({
+        timeout: 5_000,
+    });
+    // Pre-state: an already-scrolled compose would make the outcome true for the
+    // wrong reason.
+    const ta = composeTextarea(page);
+    await expect(ta).toHaveValue("");
+    expect((await composeCaretGeometry(page)).scrollTop).toBe(0);
+    // Each reply is awaited before the next is fired: the value IS the barrier
+    // proving the previous append landed, so the swipes cannot overlap.
+    const quoted = `<${specNick()}> ${cappedQuotedBody(body)}`;
+    for (let i = 1; i <= REPLIES; i++) {
+        await swipeRowRight(page, body);
+        await expect(ta).toHaveValue(draftAfterReplies(quoted, i), { timeout: 5_000 });
+    }
+    // THE regression: caret at the end of the quote AND that line inside the
+    // client box. Before the fix scrollTop stayed 0 with the caret below it.
+    expectEndCaretVisible(await composeCaretGeometry(page), MIN_OVERFLOW_PX);
+});

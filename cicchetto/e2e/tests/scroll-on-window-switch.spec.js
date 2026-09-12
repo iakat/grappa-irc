@@ -1,0 +1,469 @@
+// Scroll-on-window-switch — bug fix verification.
+//
+// Reported: opening an empty query window leaves scrollTop=0; switching
+// back to a populated channel keeps the scroll pinned to the top because
+// the underlying `[data-testid="scrollback"]` <div> is reused across
+// `selectedChannel` changes (Solid's `<Show>` without `keyed` preserves
+// the DOM). The pre-fix length-effect in ScrollbackPane.tsx only fires
+// when `messages().length` changes, so re-selecting a previously-loaded
+// channel never re-snaps to the tail.
+//
+// Fix: on every `key()` change in the channel-switch effect, snap the
+// pane to the tail (auto-follow takes over after the first append).
+//
+// #168 (2026-07-02): scroll collapsed to ONE always-bottom authority. The
+// former marker-branch (marker present → scrollIntoView) was a second
+// scrollTop authority that raced the tail-follow and yanked the view up on
+// SEND — removed from the post-send / cold-mount / length-effect paths.
+//
+// #168 regression fix (2026-07-03a): that collapse OVER-REACHED — it also
+// killed the jump-to-marker on a deliberate channel-SWITCH.
+//
+// #168 completion (2026-07-03b, vjt point-2): marker-jump extended to ALL
+// channel activation, and made RESET-PROOF. The `<For each={rows()}>` is
+// ref-keyed and the `rows()` memo rebuilds fresh wrappers each recompute, so
+// every rows change re-creates the list DOM and resets scrollTop to 0; a
+// one-shot marker jump did not survive the post-activation catch-up refresh /
+// late cursor hydration (the deterministic +1048 "307 race"). A
+// `markerActivationPending` latch now re-asserts marker-or-tail on every rows
+// recreation until the operator takes over. The activation triggers:
+//   * channel-SWITCH into a channel WITH an unread divider → jump to the
+//     MARKER (scrollIntoView({block:"start"}), atBottom=false), re-asserted;
+//   * COLD-MOUNT / app-startup into an unread channel → ALSO the MARKER (vjt
+//     point-2, reverses the #46 cold-mount-tail wontfix); no unread → tail;
+//   * resize / follow-live visibility-return → TAIL (#46 resume family,
+//     one-shot); scrolled-up visibility-return preserves position or lands on
+//     the divider (#535, atBottom()-gated — see issue535 spec);
+//   * post-send / live-append → BOTTOM (#168; the send clears the latch first).
+// The divider still renders at its frozen position (freeze-display contract,
+// DESIGN_NOTES 2026-06-08) regardless.
+//
+// ## Four scenarios
+//
+//   Scenario 1 — channel → empty query → channel-back (no marker):
+//     Tall channel, focus → lands at bottom. Open empty query via
+//     `/query <peer-without-history>`, scrollTop=0 (fallback "no
+//     messages yet"). Switch back via sidebar → expect: lands at
+//     bottom again (no unread → tail). Pre-fix: pinned at scrollTop=0.
+//
+//   Scenario 2 — COLD-MOUNT into channel-with-unreads (#168 completion):
+//     Pre-seed a read cursor for #spec-wN placing the divider mid-page (25
+//     unreads), then FIRST-focus #spec-wN straight after login (a cold mount —
+//     the key-effect is `defer`-skipped, so onMount owns the first snap).
+//     Jumps to the MARKER (near the top, distance-to-bottom ABOVE threshold),
+//     NOT the tail — the #46 cold-mount-tail wontfix reversed. A follow-on
+//     SEND must still snap to the BOTTOM (the gate). A sibling test repeats
+//     this after a full `page.reload()` (genuine app-startup).
+//
+//   Scenario 3 — SWITCH into channel-with-unreads (#168 regression fix):
+//     Focus the $server window first (mounts ScrollbackPane), let #spec-wN warm
+//     in the background (eager join-ok refresh loads all 200 rows), THEN
+//     click #spec-wN in the sidebar — a real key-change SWITCH. The pane must
+//     jump to the MARKER (marker visible near the top, distance-to-bottom
+//     ABOVE threshold — NOT the tail). Pre-fix (307 race) this stranded at
+//     scrollTop 0 (marker +1048) once the catch-up refresh recreated the DOM;
+//     the latch's re-assert makes it deterministic. A follow-on SEND must
+//     still snap to the BOTTOM (both directions).
+//
+// ## Why DB-seeded scrollback (matches cp14-b1)
+//
+// 200 rows on (vjt, bahamut-test, #bofh) seeded by `mix
+// grappa.seed_scrollback` so the channel reliably overflows the
+// viewport. See cp14-b1 spec for full rationale (fakelag throttles
+// IRC-driven seeds, DB seed is deterministic + instant).
+//
+// ## Tiny viewport
+//
+// Same 800×300 viewport cp14-b1 uses so the 50-row REST page reliably
+// overflows the scrollback area; without overflow, "lands at bottom"
+// is vacuously true and "divider above the fold" is unmeasurable.
+import { writeFileSync } from "node:fs";
+import { composeSend, installScrollTrace, loginAs, markScrollTrace, pageScrollbackRest, readScrollTrace, scrollbackLines, selectChannel, sidebarWindow, } from "../fixtures/cicchettoPage";
+import { fetchScrollbackPage, setReadCursorToId } from "../fixtures/grappaApi";
+import { assertTraceIsUsable, classifyPostSend } from "../fixtures/scrollTrace";
+import { AUTOJOIN_CHANNELS, NETWORK_SLUG } from "../fixtures/seedData";
+import { expect, specNick, specUser, test } from "../fixtures/test";
+const CHANNEL = AUTOJOIN_CHANNELS[0];
+// Mirror of ScrollbackPane.SCROLL_BOTTOM_THRESHOLD_PX = 50. Re-declared
+// here for the same reason as cp14-b1: the const isn't exported; if it
+// changes both sides need to update — test stays in lockstep.
+const SCROLL_BOTTOM_THRESHOLD_PX = 50;
+const REST_PAGE_SIZE = 50;
+// A peer nick that has NO DM history with vjt — `/query` opens an empty
+// window. Doesn't matter who the peer is; just must not collide with
+// any seeded sender. Using a deliberately-synthetic nick keeps the
+// fixture decoupled from any future seed expansion.
+const EMPTY_QUERY_PEER = "no-dm-peer-bnda3";
+async function scrollbackGeometry(page) {
+    return await page.evaluate(() => {
+        const el = document.querySelector('[data-testid="scrollback"]');
+        if (!el)
+            throw new Error("scrollback container not found");
+        return {
+            scrollTop: el.scrollTop,
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight,
+        };
+    });
+}
+test.describe("scroll-on-window-switch — re-selecting a window snaps correctly", () => {
+    test.use({ viewport: { width: 800, height: 300 } });
+    test("channel → empty query → channel-back: scroll lands at bottom-or-marker on return", async ({ page, }) => {
+        const vjt = specUser();
+        if (!CHANNEL)
+            throw new Error("AUTOJOIN_CHANNELS empty");
+        // Step 1 — focus the seeded channel and confirm scroll lands at the
+        // bottom: the "no marker" path this scenario (Scenario 1) is named
+        // for. Pre-fix bug: scrollTop stayed at 0 — the operator saw the
+        // very first row of history, not the recent context.
+        //
+        // Precondition: mark #spec-wN fully read BEFORE login. The auto-reset
+        // (_vjtReset, fixtures/test.ts) re-seeds #spec-wN with freshly-
+        // timestamped rows and clears the read cursor; with no cursor
+        // hydrated, cic counts those recent rows as live-unread and pins the
+        // unread-marker to the very first row (scrollTop=0). That state is
+        // ORDER-DEPENDENT — absent in isolation (the seeder's rows are old
+        // by test time, so read), present after a prior spec's afterEach
+        // reset (rows seconds old, so unread) — which is why this spec
+        // passed solo (3/3) yet failed mid-suite: a marker pinned to the top
+        // breaks BOTH the "at bottom" and the "marker mid-pane" branches
+        // asserted below. Seeding the cursor to HEAD makes the documented
+        // "(no marker)" scenario deterministic. Sibling test 2 seeds its OWN
+        // mid-page cursor for the divider-present-lands-at-bottom scenario
+        // (#168); this is the read-to-tail counterpart, not a workaround.
+        const headPage = await fetchScrollbackPage(vjt.token, NETWORK_SLUG, CHANNEL);
+        expect(headPage.length).toBeGreaterThanOrEqual(REST_PAGE_SIZE);
+        const headId = headPage[0]?.id;
+        if (!headId)
+            throw new Error("#spec-wN seed page empty — cannot seed read cursor to head");
+        await setReadCursorToId(vjt.token, NETWORK_SLUG, CHANNEL, headId);
+        await loginAs(page, vjt);
+        await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+        await expect
+            .poll(async () => await scrollbackLines(page).count(), { timeout: 10_000 })
+            .toBeGreaterThanOrEqual(REST_PAGE_SIZE);
+        const g1 = await scrollbackGeometry(page);
+        expect(g1.scrollHeight).toBeGreaterThan(g1.clientHeight);
+        // #168: cursor seeded to HEAD → no divider → lands at the bottom.
+        await expect
+            .poll(async () => {
+            const cur = await scrollbackGeometry(page);
+            return cur.scrollHeight - cur.scrollTop - cur.clientHeight;
+        })
+            .toBeLessThanOrEqual(SCROLL_BOTTOM_THRESHOLD_PX);
+        // Step 2 — open an empty query via /query. compose.ts dispatches:
+        //   openQueryWindowState(nid, peer, _) + setSelectedChannel(...)
+        // so the pane re-renders with kind:"query", channelName=peer.
+        // Empty scrollback → "no messages yet" fallback → scrollTop=0.
+        await composeSend(page, `/query ${EMPTY_QUERY_PEER}`);
+        // The query window now appears in the sidebar; wait for the focus
+        // to actually flip (the visible scrollback shows the empty fallback).
+        await expect(page.locator(".scrollback-empty")).toBeVisible({ timeout: 5_000 });
+        const g2 = await scrollbackGeometry(page);
+        // Empty scrollback contains only the "no messages yet" placeholder
+        // — scrollHeight ≈ clientHeight, scrollTop=0.
+        expect(g2.scrollTop).toBe(0);
+        // Step 3 — switch back to the channel via the sidebar. THIS is the
+        // bug-under-fix: pre-fix the length-effect doesn't fire (length
+        // unchanged from last time we visited this channel), and the bare
+        // <div> ref keeps scrollTop=0 from the query window's render. The
+        // user sees the channel pinned to the top of its history.
+        await sidebarWindow(page, NETWORK_SLUG, CHANNEL).locator(".sidebar-window-btn").click();
+        // Wait for the channel scrollback to mount (rows reappear).
+        await expect
+            .poll(async () => await scrollbackLines(page).count(), { timeout: 10_000 })
+            .toBeGreaterThanOrEqual(REST_PAGE_SIZE);
+        // Contract (#168): scroll position lands at the bottom on re-selection
+        // — same shape as step 1. Pre-fix this failed — scrollTop stayed at 0
+        // (or whatever value the query left behind).
+        await expect
+            .poll(async () => {
+            const cur = await scrollbackGeometry(page);
+            return cur.scrollHeight - cur.scrollTop - cur.clientHeight;
+        }, { timeout: 5_000 })
+            .toBeLessThanOrEqual(SCROLL_BOTTOM_THRESHOLD_PX);
+    });
+    test("fresh focus / cold-mount into channel-with-unreads: jumps to the marker, then a send snaps to bottom (#168)", async ({ page, }) => {
+        const vjt = specUser();
+        if (!CHANNEL)
+            throw new Error("AUTOJOIN_CHANNELS empty");
+        // Pre-seed a cursor 25 rows from the tail of #spec-wN so the divider injects
+        // mid-page. Same shape cp14-b1 scenario 2 uses.
+        //
+        // #168 completion (2026-07-03b, vjt point-2): the FIRST focus after login
+        // is a COLD MOUNT (the channel-switch key-effect is `defer`-skipped, so
+        // onMount owns the first snap). It USED to land at the TAIL (#46
+        // cold-mount-tail wontfix — the assertion this test previously encoded).
+        // vjt reversed that: cold-mount now jumps to the frozen divider, SAME as a
+        // deliberate switch. This test therefore now mirrors scenario 3's marker
+        // contract, reached via cold-mount instead of a switch.
+        const page0 = await fetchScrollbackPage(vjt.token, NETWORK_SLUG, CHANNEL);
+        expect(page0.length).toBeGreaterThanOrEqual(REST_PAGE_SIZE);
+        const cursorRow = page0[25];
+        if (!cursorRow)
+            throw new Error("seeded page too short for cursor placement");
+        await setReadCursorToId(vjt.token, NETWORK_SLUG, CHANNEL, cursorRow.id);
+        await loginAs(page, vjt);
+        await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+        await expect
+            .poll(async () => await scrollbackLines(page).count(), { timeout: 10_000 })
+            .toBeGreaterThanOrEqual(REST_PAGE_SIZE);
+        const marker = page.locator('[data-testid="unread-marker"]');
+        await expect(marker).toHaveCount(1);
+        // #1336 S2 — settle BEFORE measuring. The activation writes scrollTop
+        // three times (rows recreation to the top, marker jump in flight, marker),
+        // and every assertion below reads a position, so each one must be taken of
+        // a pane that has stopped. The distance test alone cannot do this: it is
+        // satisfied by the reset too, which is the same pane 1071px from where
+        // this test means it to be. Rejects by name if the pane never holds still.
+        await pageScrollbackRest(page, 10_000);
+        // Sanity: scrollback overflows (else "not at the tail" is vacuous).
+        const g = await scrollbackGeometry(page);
+        expect(g.scrollHeight).toBeGreaterThan(g.clientHeight);
+        // Contract 1 (#168 completion): cold-mount lands on the MARKER, not the
+        // tail — distance-to-bottom is ABOVE threshold. The `markerActivationPending`
+        // latch re-asserts the jump across the post-mount catch-up refresh + late
+        // cursor hydration, so this is deterministic (the 307 race fix).
+        await expect
+            .poll(async () => {
+            const cur = await scrollbackGeometry(page);
+            return cur.scrollHeight - cur.scrollTop - cur.clientHeight;
+        })
+            .toBeGreaterThan(SCROLL_BOTTOM_THRESHOLD_PX);
+        // Contract 2: the marker sits near the TOP of the viewport (block:"start")
+        // and is on-screen — the operator sees the unread messages that follow it.
+        await expect
+            .poll(async () => page.evaluate(() => {
+            const el = document.querySelector('[data-testid="scrollback"]');
+            const m = document.querySelector('[data-testid="unread-marker"]');
+            if (!el || !m)
+                return Number.NaN;
+            return m.getBoundingClientRect().top - el.getBoundingClientRect().top;
+        }))
+            .toBeLessThan(g.clientHeight / 2);
+        const markerOffset = await page.evaluate(() => {
+            const el = document.querySelector('[data-testid="scrollback"]');
+            const m = document.querySelector('[data-testid="unread-marker"]');
+            if (!el || !m)
+                throw new Error("scrollback/marker not found");
+            return m.getBoundingClientRect().top - el.getBoundingClientRect().top;
+        });
+        expect(markerOffset).toBeGreaterThanOrEqual(-5);
+        await expect(marker).toBeInViewport();
+        // Contract 3 (gate): a SEND from the cold-mounted marker-parked pane still
+        // snaps to the BOTTOM — the own-send clears the latch first, then
+        // scrollToBottom owns the scroll (#168 post-send authority; do NOT re-open
+        // the send-jump). The divider clears.
+        const sent = `coldmount-then-send ${Date.now()}`;
+        await composeSend(page, sent);
+        const sentLine = scrollbackLines(page).filter({ hasText: sent });
+        await expect(sentLine).toHaveCount(1, { timeout: 10_000 });
+        await expect
+            .poll(async () => {
+            const cur = await scrollbackGeometry(page);
+            return cur.scrollHeight - cur.scrollTop - cur.clientHeight;
+        })
+            .toBeLessThanOrEqual(SCROLL_BOTTOM_THRESHOLD_PX);
+        await expect(sentLine).toBeInViewport();
+        await expect(marker).toHaveCount(0, { timeout: 5_000 });
+    });
+    test("app-startup: cold-mount into a selected unread channel after a full reload jumps to the marker (#168)", async ({ page, }) => {
+        const vjt = specUser();
+        if (!CHANNEL)
+            throw new Error("AUTOJOIN_CHANNELS empty");
+        // The genuine app-startup path: a full PWA reload re-boots the SPA, so the
+        // FIRST window focus after the reload cold-mounts the ScrollbackPane fresh
+        // (onMount, key-effect defer-skipped) — the same lifecycle as launching the
+        // installed PWA. #spec-wN is never focused before the reload, so its seeded
+        // read cursor is never advanced and the unread divider survives the reboot.
+        const page0 = await fetchScrollbackPage(vjt.token, NETWORK_SLUG, CHANNEL);
+        expect(page0.length).toBeGreaterThanOrEqual(REST_PAGE_SIZE);
+        const cursorRow = page0[25];
+        if (!cursorRow)
+            throw new Error("seeded page too short for cursor placement");
+        await setReadCursorToId(vjt.token, NETWORK_SLUG, CHANNEL, cursorRow.id);
+        await loginAs(page, vjt);
+        // Reboot the app BEFORE any window focus, then focus #spec-wN — a cold mount
+        // on a freshly-booted SPA.
+        await page.reload();
+        await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+        await expect
+            .poll(async () => await scrollbackLines(page).count(), { timeout: 10_000 })
+            .toBeGreaterThanOrEqual(REST_PAGE_SIZE);
+        const marker = page.locator('[data-testid="unread-marker"]');
+        await expect(marker).toHaveCount(1);
+        // #1336 S2 — settle BEFORE measuring. The activation writes scrollTop
+        // three times (rows recreation to the top, marker jump in flight, marker),
+        // and every assertion below reads a position, so each one must be taken of
+        // a pane that has stopped. The distance test alone cannot do this: it is
+        // satisfied by the reset too, which is the same pane 1071px from where
+        // this test means it to be. Rejects by name if the pane never holds still.
+        await pageScrollbackRest(page, 10_000);
+        const g = await scrollbackGeometry(page);
+        expect(g.scrollHeight).toBeGreaterThan(g.clientHeight);
+        // Cold-mount after reboot lands on the MARKER (not the tail), near the top
+        // of the viewport, on-screen.
+        await expect
+            .poll(async () => {
+            const cur = await scrollbackGeometry(page);
+            return cur.scrollHeight - cur.scrollTop - cur.clientHeight;
+        })
+            .toBeGreaterThan(SCROLL_BOTTOM_THRESHOLD_PX);
+        const markerOffset = await page.evaluate(() => {
+            const el = document.querySelector('[data-testid="scrollback"]');
+            const m = document.querySelector('[data-testid="unread-marker"]');
+            if (!el || !m)
+                throw new Error("scrollback/marker not found");
+            return m.getBoundingClientRect().top - el.getBoundingClientRect().top;
+        });
+        expect(markerOffset).toBeGreaterThanOrEqual(-5);
+        expect(markerOffset).toBeLessThan(g.clientHeight / 2);
+        await expect(marker).toBeInViewport();
+    });
+    test("SWITCH into channel-with-unreads: jumps to the marker, then a send snaps to bottom", async ({ page, }) => {
+        const vjt = specUser();
+        if (!CHANNEL)
+            throw new Error("AUTOJOIN_CHANNELS empty");
+        // Seed a cursor 25 rows from the tail so an unread divider injects
+        // mid-page (same shape as scenario 2 / issue168), but here we reach
+        // #spec-wN via a deliberate SWITCH, not a cold mount.
+        const page0 = await fetchScrollbackPage(vjt.token, NETWORK_SLUG, CHANNEL);
+        expect(page0.length).toBeGreaterThanOrEqual(REST_PAGE_SIZE);
+        const cursorRow = page0[25];
+        if (!cursorRow)
+            throw new Error("seeded page too short for cursor placement");
+        await setReadCursorToId(vjt.token, NETWORK_SLUG, CHANNEL, cursorRow.id);
+        // Deterministic warmth gate: cic eagerly `refreshScrollback`es every
+        // joined channel on its Phoenix join-ok (subscribe.ts) — REFRESH_LIMIT
+        // (200) == the seed size, so #spec-wN loads ALL rows in the background
+        // WITHOUT us focusing it. Register the waiter BEFORE loginAs so the
+        // post-boot fetch can't slip past us; awaiting it proves the channel is
+        // warm (rows in the store) before we switch into it. Without warmth the
+        // switch's scrollToActivation early-returns on an empty pane and the
+        // length-effect tails — the marker jump only fires against a settled,
+        // populated pane. The URL is `.../channels/<encoded>/messages?after=…`,
+        // and the encoding is derived rather than spelled: the `%23bofh` this
+        // used to carry survived every `#bofh` grep and outlived the channel
+        // it named (#1336).
+        const channelWarm = page.waitForResponse((r) => r.url().includes(`/channels/${encodeURIComponent(CHANNEL)}/messages`) && r.status() === 200, { timeout: 20_000 });
+        // #1336 (row #1079) — record the switch and the send, on the three
+        // channels the freeze can show up on. Before `loginAs`, because the
+        // recorder is an init script and has to be in place before the SPA boots.
+        await installScrollTrace(page);
+        await loginAs(page, vjt);
+        // FROM-window: the always-present $server window mounts ScrollbackPane
+        // WITHOUT touching #spec-wN's read cursor (focusing #spec-wN first would fire
+        // the leave-arm on the way out and advance its cursor to the tail,
+        // erasing the unread we need). `windowName === NETWORK_SLUG` resolves to
+        // the $server tab; awaitWsReady:false — no auto-join echo to wait on.
+        await selectChannel(page, NETWORK_SLUG, NETWORK_SLUG, { awaitWsReady: false });
+        await expect(page.locator('[data-testid="scrollback"]')).toBeVisible({ timeout: 10_000 });
+        // #spec-wN scrollback fetched → warm. Only now is the switch a warm one.
+        await channelWarm;
+        // THE SWITCH — click #spec-wN in the sidebar. key() changes $server→#spec-wN,
+        // firing the channel-switch key-effect (prevKey defined, so NOT the
+        // defer-skipped mount run). This is the trigger the #168 collapse
+        // over-reached into.
+        await sidebarWindow(page, NETWORK_SLUG, CHANNEL).locator(".sidebar-window-btn").click();
+        await expect
+            .poll(async () => await scrollbackLines(page).count(), { timeout: 10_000 })
+            .toBeGreaterThanOrEqual(REST_PAGE_SIZE);
+        const marker = page.locator('[data-testid="unread-marker"]');
+        await expect(marker).toHaveCount(1);
+        // #1336 S2 — settle BEFORE measuring. The activation writes scrollTop
+        // three times (rows recreation to the top, marker jump in flight, marker),
+        // and every assertion below reads a position, so each one must be taken of
+        // a pane that has stopped. The distance test alone cannot do this: it is
+        // satisfied by the reset too, which is the same pane 1071px from where
+        // this test means it to be. Rejects by name if the pane never holds still.
+        await markScrollTrace(page, "rest-exit", await pageScrollbackRest(page, 10_000));
+        // Sanity: the pane overflows (else "not at the tail" is vacuous).
+        const g = await scrollbackGeometry(page);
+        expect(g.scrollHeight).toBeGreaterThan(g.clientHeight);
+        // Contract assertion 1 (regression): the switch landed on the MARKER,
+        // NOT the tail — distance-to-bottom is ABOVE threshold. RED pre-fix:
+        // the #168 always-tail authority leaked into the switch and this was
+        // <= threshold (pinned at the bottom, divider off-screen above).
+        await expect
+            .poll(async () => {
+            const cur = await scrollbackGeometry(page);
+            return cur.scrollHeight - cur.scrollTop - cur.clientHeight;
+        })
+            .toBeGreaterThan(SCROLL_BOTTOM_THRESHOLD_PX);
+        // Contract assertion 2: the marker sits near the TOP of the viewport
+        // (block:"start"), i.e. it is on-screen and in the upper region — the
+        // operator sees the unread messages that follow it. Measured as the
+        // marker's top offset from the scroll container's visible top.
+        await expect
+            .poll(async () => page.evaluate(() => {
+            const el = document.querySelector('[data-testid="scrollback"]');
+            const m = document.querySelector('[data-testid="unread-marker"]');
+            if (!el || !m)
+                return Number.NaN;
+            return m.getBoundingClientRect().top - el.getBoundingClientRect().top;
+        }))
+            .toBeLessThan(g.clientHeight / 2);
+        const markerOffset = await page.evaluate(() => {
+            const el = document.querySelector('[data-testid="scrollback"]');
+            const m = document.querySelector('[data-testid="unread-marker"]');
+            if (!el || !m)
+                throw new Error("scrollback/marker not found");
+            return m.getBoundingClientRect().top - el.getBoundingClientRect().top;
+        });
+        expect(markerOffset).toBeGreaterThanOrEqual(-5);
+        await expect(marker).toBeInViewport();
+        // BOTH DIRECTIONS: a SEND from the marker-parked pane must still snap to
+        // the BOTTOM (#168 post-send authority preserved — the scope fix must
+        // not re-break it). The sent line lands in the viewport, divider clears.
+        const sent = `switch-then-send ${Date.now()}`;
+        await markScrollTrace(page, "send", null);
+        await composeSend(page, sent);
+        const sentLine = scrollbackLines(page).filter({ hasText: sent });
+        await expect(sentLine).toHaveCount(1, { timeout: 10_000 });
+        // #1336 (row #1079) — the trace is saved on GREEN as well as on red: a
+        // near-miss on a passing run is the datum this row is short of. The
+        // classification runs afterwards either way, so a freeze is accused BY
+        // NAME instead of arriving as the anonymous `337` the issue reports.
+        let settleFailure = null;
+        try {
+            await expect
+                .poll(async () => {
+                const cur = await scrollbackGeometry(page);
+                return cur.scrollHeight - cur.scrollTop - cur.clientHeight;
+            })
+                .toBeLessThanOrEqual(SCROLL_BOTTOM_THRESHOLD_PX);
+        }
+        catch (err) {
+            settleFailure = err;
+        }
+        // The terminal distance comes from a LIVE read, taken before the trace so
+        // the trace covers every moment the number describes. Deriving it from the
+        // trace's last record accused a pane that was already at the tail
+        // (2026-08-19, full suite run 1): the recorder had simply not been handed
+        // the post-send `scroll` event yet.
+        const settled = await scrollbackGeometry(page);
+        const finalDistancePx = settled.scrollHeight - settled.scrollTop - settled.clientHeight;
+        const trace = await readScrollTrace(page);
+        const verdict = classifyPostSend(trace, {
+            thresholdPx: SCROLL_BOTTOM_THRESHOLD_PX,
+            finalDistancePx,
+        });
+        // Written to the output path rather than attached as a body: measured, an
+        // attachment on a PASSING run does not survive into the report, and a
+        // near-miss on a green run is exactly the datum this row is short of.
+        const tracePath = test.info().outputPath("scroll-trace.json");
+        writeFileSync(tracePath, JSON.stringify({ verdict, trace }, null, 2));
+        await test.info().attach("scroll-trace", { path: tracePath, contentType: "application/json" });
+        // The presence check first: an instrument that recorded nothing must not
+        // license a conclusion either way.
+        assertTraceIsUsable(trace);
+        if (verdict.kind === "FROZEN-AT-MARKER")
+            throw new Error(`#1079: the pane froze ${verdict.distance}px from the bottom after the send, ` +
+                `attributed to ${verdict.attributedTo}`);
+        // Nothing was frozen, so whatever the poll said stands on its own.
+        if (settleFailure !== null)
+            throw settleFailure;
+        await expect(sentLine).toBeInViewport();
+        await expect(marker).toHaveCount(0, { timeout: 5_000 });
+    });
+});

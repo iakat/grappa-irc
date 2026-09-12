@@ -1,0 +1,66 @@
+// P-0b — peer-away banner. When the operator /msg's a peer who is
+// AWAY, upstream sends back a 301 RPL_AWAY. Pre-P-0b that leaked as
+// a bare notice; with P-0b the server emits a typed `peer_away` wire
+// event on Topic.user/1 and cic mounts the PeerAwayBanner inside the
+// peer's DM scrollback pane.
+//
+// This e2e drives the full path:
+//   1. peer connects + sets `/AWAY :Gone fishing`
+//   2. operator opens a DM window via /msg (the textarea path)
+//   3. server's standalone-301 arm fires → cic banner appears
+//
+// Per `feedback_ux_e2e_mandatory`: every cic UX-touching change ships
+// with a Playwright e2e via scripts/integration.sh.
+import { composeSend, loginAs, selectChannel, sidebarWindow, waitForDmListenerReady, } from "../fixtures/cicchettoPage";
+import { IrcPeer } from "../fixtures/ircClient";
+import { AUTOJOIN_CHANNELS, NETWORK_SLUG } from "../fixtures/seedData";
+import { expect, specNick, specUser, test } from "../fixtures/test";
+const PEER_NICK = "p0b-away-peer";
+const AWAY_MESSAGE = "Gone fishing — back at 5pm";
+const CHANNEL = AUTOJOIN_CHANNELS[0];
+test("P-0b — /msg to away peer surfaces peer_away banner in DM window", async ({ page }) => {
+    const vjt = specUser();
+    await loginAs(page, vjt);
+    await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+    await waitForDmListenerReady(page, NETWORK_SLUG);
+    const peer = await IrcPeer.connect({ nick: PEER_NICK });
+    try {
+        // Peer goes AWAY before the operator messages them. AWAY ack = 306
+        // RPL_NOWAWAY back to peer; the peer is now flagged +a server-side
+        // and any inbound PRIVMSG triggers a 301 back to the sender.
+        await peer.away(AWAY_MESSAGE);
+        // Operator opens a DM via /msg. compose.ts splits on slash-cmd and
+        // routes to send_privmsg server-side; the server opens the DM
+        // window via the standard PRIVMSG path. Bahamut sees PRIVMSG to an
+        // away peer and replies with 301 carrying AWAY_MESSAGE.
+        await composeSend(page, `/msg ${peer.nick} ping`);
+        // The DM window auto-opens on outbound /msg (compose.ts's
+        // explicit openQueryWindowState call). Sanity check before we
+        // assert the banner.
+        await expect(sidebarWindow(page, NETWORK_SLUG, peer.nick)).toHaveCount(1, { timeout: 5_000 });
+        // Switch focus to the DM window — the banner mounts only when the
+        // selected window matches (slug, peer).
+        await selectChannel(page, NETWORK_SLUG, peer.nick, { awaitWsReady: false });
+        // Banner renders peer + the away message verbatim. Server is the
+        // source of truth for the message text; the "is away" framing is
+        // built by cic per feedback_no_localized_strings_server_side.
+        // Banner budget is 10 s, not 5 s, and the number is measured (#1307).
+        // The 301 crosses bahamut's fake-lag ceiling: `do_client_queue` drains
+        // the recvQ only while `cptr->since - timeofday < 10` (s_bsd.c), and
+        // `timeofday` is a `time_t` — whole seconds. So the reply resumes on an
+        // integer-second boundary and the banner arrives on a 1 s LATTICE. Over
+        // 20 uncensored local iterations at a constant −3.5 s headroom the
+        // arrivals were 2.91 (x2) / 3.92 (x4) / 4.91 (x12) / 5.93 (x2): the old 5 s
+        // budget cut 54 ms above the MODE, so it failed whenever the run landed
+        // one tick out. 10 s clears the measured maximum by four ticks, and is
+        // what `issue270-peer-away-overlap` already budgets for this same banner.
+        const banner = page.locator("[data-testid='peer-away-banner']");
+        await expect(banner).toBeVisible({ timeout: 10_000 });
+        await expect(banner).toContainText(peer.nick);
+        await expect(banner).toContainText("is away");
+        await expect(banner).toContainText(AWAY_MESSAGE);
+    }
+    finally {
+        await peer.disconnect("P-0b done");
+    }
+});

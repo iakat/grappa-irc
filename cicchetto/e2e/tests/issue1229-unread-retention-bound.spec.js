@@ -1,0 +1,289 @@
+// #1229 — the unread exemption has a ceiling now, and crossing it is visible.
+//
+// S20's ring cap never evicts a row at/after the read cursor. That exemption
+// had no ceiling, so a channel the operator does not read holds ALL of its
+// unread rows and the cap does nothing. Since the pane renders every retained
+// row (measured on origin/main: 1084 retained rows produce 1084
+// `.scrollback-line` nodes, ratio 1.0000, no windowing anywhere in the render
+// path), retention and rendered DOM are the same curve — ~19-26 KB of renderer
+// memory per row, ~26 MB for the reporter's window, against a ceiling iOS
+// applies per web process.
+//
+// The bound is one page of unread (`UNREAD_RETENTION_CAP = PAGE_LIMIT`), and
+// past it the window joins the far-behind state the client already has for
+// exactly this shape: divider suppressed, "N unread — jump back" banner,
+// `jumpToUnread` rebuilding the region from the server.
+//
+// ── #1538 REVERSED points 3 and 4 of this spec. Read this before the list ──
+//
+// This spec used to pin the opposite of what it pins now, and the history
+// matters because the reversal is a ruling, not a refactor.
+//
+// Points 3 and 4 below USED TO read: "the OLDEST unread row is gone from the
+// DOM, and the rows the operator is looking at are NOT", and "`scrollTop` is
+// preserved across the bite" — with the note that this "distinguishes the
+// implementation that shipped from the simpler one that did not: dropping
+// 'everything but the newest page' would have satisfied (2) while deleting
+// the screen out from under a reader scrolled up in history."
+//
+// What that traded away is what #1538 came back as. Keeping the read context
+// while excising the oldest unread means lifting a block out of the INTERIOR
+// of the loaded range, and the read cursor was standing in for "where the
+// operator is looking". For the reader who has scrolled DOWN past the divider
+// — into the unread region — the rows "just under the divider" are the rows on
+// screen, and the excision cut them out from under them. Two reporters,
+// #sniffo, nine rows out of the middle of a rendered range, unrepairable by
+// scrolling up (`loadMore` pages before `rows[0]`, which sits ABOVE the hole).
+//
+// vjt's ruling on #1538, and it is the acceptance criterion this spec now
+// verifies rather than a preference it accommodates:
+//
+//     "basta che lo scroll sia contiguo e non ci siano buchi"
+//
+// So the bound now collapses to a contiguous tail window, the read context
+// goes with the prefix, and the viewport DOES move — an announced loss, on a
+// pane that is simultaneously raising "N unread — jump back". The assertions
+// below are that criterion, checked from outside.
+//
+// ── What this spec pins, and why each assertion is here ──────────────────
+//
+// The gesture is ONE live PRIVMSG, not a flood. The cursor is planted so the
+// window sits at exactly one page of unread — the widest window every path
+// still calls near — so a single arriving row is the whole crossing; a burst
+// would prove the same thing while also inviting the ircd's flood kill into
+// the spec.
+//
+//   1. Before the gesture: no bar, and the in-pane divider is there. Without
+//      this the outcome could be a bar that was already up for another reason
+//      (a cold far-behind resume, #693) and the spec would test nothing.
+//   2. After it: the bar is up with the honest total, and the divider is gone.
+//      That is the state transition, seen from outside.
+//   3. THE RULING: what remains in the DOM is a CONTIGUOUS run of the
+//      channel's rows as the server orders them — no hole, at any width.
+//      Checked against `fetchAllMessagesAsc` rather than by id arithmetic,
+//      and that is load-bearing: `messages.id` is a GLOBAL autoincrement, so
+//      consecutive rows of one channel carry non-consecutive ids and an
+//      id-gap scan cannot tell a punched hole from ordinary numbering. The
+//      server's own ordering is the only thing that can. The assertion is
+//      only meaningful because the list is not virtualised — every retained
+//      row is in the DOM whatever the scroll position, which is the same
+//      measurement that motivated #1229 in the first place.
+//   4. The oldest unread row AND the read-context row are both gone: the drop
+//      is a PREFIX. Pinning both ends is what separates the collapse from an
+//      excision that merely happened to take the row this spec sampled.
+//
+// Scrolling up is also what keeps the precondition alive: `setCursorIfAdvances`
+// is forward-only, so with the pane scrolled into the read context the settle
+// writer can only propose an id BELOW the planted cursor, and is refused. A
+// pane left at the tail would advance the cursor to the newest row, unread
+// would fall to zero, and the ceiling would never be approached.
+//
+// ── Why the peer joins during SETUP, and not as part of the gesture ──────
+//
+// A peer's JOIN is a scrollback row like any other. Server side, an
+// other-user JOIN emits `:persist :join` (`lib/grappa/session/event_router.ex`,
+// pinned by `test/grappa/session/event_router_test.exs:1727` — "JOIN-other
+// adds nick to state.members[channel] + emits :persist :join"). Client side
+// nothing filters it back out: `subscribe.ts`'s `routeMessage` appends every
+// message with no kind gate, and `capScrollbackRing`'s `unreadHeld` counts
+// rows by id with no kind gate either.
+//
+// So a JOIN issued AFTER the cursor is planted lands above it, and the
+// "one row" crossing is really TWO: the JOIN takes the protected region past
+// the ceiling and the bound bites once (banner at `unreadHeld`), then the
+// PRIVMSG bites it again — and `scrollback.ts`'s accumulation on the second
+// bite (`current.missed + unreadDropped`, deliberate: after the first bite the
+// store only ever holds one page, so a recount would report the bound forever
+// while the operator is thousands behind) reports `UNREAD_BOUND + 1` RAW ROWS.
+//
+// #2037 A changed what the banner DISPLAYS of that: the number is the MESSAGES
+// bucket now, so the JOINs past the cursor come out of it and this fixture
+// reads 199 rather than 201. The ARMING is untouched and still raw — what arms
+// far-behind is "a row at/after the cursor left the store", which a JOIN does
+// as surely as a message. Only the displayed quantity narrowed, and the
+// assertion below derives the expected value rather than carrying a second
+// magic number.
+//
+// That number is an artefact of the setup, not the behaviour under test. The
+// peer therefore joins BEFORE anything is measured, so its row is part of the
+// read history the cursor is planted into, and the gesture is the single
+// PRIVMSG this spec says it is.
+//
+// ── NOT covered here, deliberately ───────────────────────────────────────
+//
+// The far-behind banner's own behaviour (jump, dismiss, badge) belongs to
+// #693/#888/#1019 and is pinned there; this spec asserts only that the bound
+// DELIVERS the window into that state. The memory figures above are not
+// asserted by any e2e — they were measured with a browser and a heap probe,
+// and a spec that re-measured them would be pinning the host, not the product.
+//
+// This spec does NOT claim anything about the half-height frame #1229 was
+// filed for: that reproduces with the admin pane focused and zero scrollback
+// rows mounted, so no scrollback bound can explain it.
+import { loginAs, selectChannel } from "../fixtures/cicchettoPage";
+import { fetchAllMessagesAsc, getReadCursor, resetSubject, setReadCursorToId, } from "../fixtures/grappaApi";
+import { IrcPeer } from "../fixtures/ircClient";
+import { AUTOJOIN_CHANNELS, getSeededAdmin, NETWORK_SLUG } from "../fixtures/seedData";
+import { expect, specUser, test } from "../fixtures/test";
+const CHANNEL = AUTOJOIN_CHANNELS[0];
+// `UNREAD_RETENTION_CAP` in `lib/scrollback.ts` — one page, the same number
+// `isFarBehind` already draws the line at. Mirrored rather than imported: the
+// e2e bundle is the built app, and a spec that imported the source constant
+// would keep passing if the shipped bundle disagreed with it.
+//
+// #1646 — src/__tests__/e2eConstantMirrors.test.ts pins this copy to the
+// production constant, which is DERIVED (`= PAGE_LIMIT`): the number can move
+// from a module this comment does not name, and until that pin nothing noticed.
+const UNREAD_BOUND = 200;
+// Enough history that the pane has a read context to be scrolled up INTO,
+// above the bound so the planted cursor has somewhere to sit.
+const SEED_COUNT = 420;
+const SEED_SENDER = "seed-bot";
+const PEER_NICK = "bound1229";
+// AT the ceiling, which is the last state before the bound bites: the bound is
+// on the UNREAD region alone (the boundary row the divider anchors on is never
+// this bound's to drop), and it is crossed at `> UNREAD_BOUND` — the same
+// comparison `isFarBehind` makes, so a window holding exactly one page is still
+// classified near by every path. One arriving row is the whole crossing.
+const UNREAD_BEFORE = UNREAD_BOUND;
+const OUTCOME_TIMEOUT_MS = 10_000;
+// The tolerance `issue196-preview-scroll-preserve` uses for "the viewport did
+// not move": sub-pixel geometry, not a budget for a jump.
+const SCROLL_TOLERANCE_PX = 3;
+const scrollGeometry = (page) => page.evaluate(() => {
+    const el = document.querySelector('[data-testid="scrollback"]');
+    if (el === null)
+        throw new Error("#1229 spec: scrollback container missing");
+    return {
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+    };
+});
+test.describe("#1229 — the unread retention bound", () => {
+    test.use({ viewport: { width: 800, height: 400 } });
+    test("crossing one page of unread collapses to a CONTIGUOUS tail window and raises the far-behind bar (#1538)", async ({ page, }) => {
+        if (!CHANNEL)
+            throw new Error("AUTOJOIN_CHANNELS empty");
+        const vjt = specUser();
+        const admin = getSeededAdmin();
+        await resetSubject(admin.token, vjt.name, { [NETWORK_SLUG]: AUTOJOIN_CHANNELS }, { [NETWORK_SLUG]: [{ name: CHANNEL, seedCount: SEED_COUNT, seedSender: SEED_SENDER }] });
+        const peer = await IrcPeer.connect({ nick: PEER_NICK });
+        try {
+            await peer.join(CHANNEL);
+            // `join()` resolves on the ircd's echo to the PEER, which says nothing
+            // about grappa having persisted the row it produces on OUR session. The
+            // cursor is planted by id, so wait for that row to exist before reading
+            // the ids — otherwise it lands above the cursor and is unread after all,
+            // which is the whole failure this ordering exists to prevent.
+            await expect
+                .poll(async () => {
+                const seen = await fetchAllMessagesAsc(vjt.token, NETWORK_SLUG, CHANNEL);
+                return seen.some((r) => r.kind === "join" && r.sender === PEER_NICK);
+            }, { timeout: OUTCOME_TIMEOUT_MS })
+                .toBe(true);
+            const rows = await fetchAllMessagesAsc(vjt.token, NETWORK_SLUG, CHANNEL);
+            expect(rows.length).toBeGreaterThan(UNREAD_BEFORE + 20);
+            const cursorRow = rows[rows.length - 1 - UNREAD_BEFORE];
+            const oldestUnread = rows[rows.length - UNREAD_BEFORE];
+            const readContextRow = rows[rows.length - 1 - UNREAD_BEFORE - 10];
+            if (!cursorRow || !oldestUnread || !readContextRow) {
+                throw new Error("#1229 spec: seeded rows missing an index");
+            }
+            // Precondition, guarded rather than assumed: exactly AT the ceiling. One
+            // row above and the pane would already be far behind on load. This is
+            // also what proves the peer's JOIN landed BELOW the cursor — if it had
+            // not, this count would be one too high.
+            expect(rows.filter((r) => r.id > cursorRow.id).length).toBe(UNREAD_BEFORE);
+            // #2037 A — the banner's number is the MESSAGES bucket now, not the raw
+            // row count, so the expectation below is derived from the fixture rather
+            // than being `UNREAD_BOUND + 1`. See the comment at that assertion.
+            //
+            // The two kinds are NAMED rather than the content predicate mirrored:
+            // this fixture puts exactly PRIVMSGs and JOINs past the cursor (the
+            // peer's JOIN, and vjt's own autojoin self-JOIN — which lands AFTER the
+            // seeded block, because the reset purges and seeds BEFORE it respawns
+            // the session). The `every` below is what keeps that exact: a third kind
+            // appearing fails here instead of quietly skewing the count.
+            //
+            // `capScrollbackRing`'s content twin filters `isContentKind` with NO
+            // own-nick arm, so on this path the self-JOIN drops out as a KIND and
+            // not as an own row — which is why counting joins is the whole of it.
+            const past = rows.filter((r) => r.id > cursorRow.id);
+            expect(past.every((r) => r.kind === "privmsg" || r.kind === "join"), "#1229 fixture grew a third row kind — the derivation below is no longer exact").toBe(true);
+            const presencePast = past.filter((r) => r.kind === "join").length;
+            expect(presencePast, "no presence rows past the cursor — see the comment").toBeGreaterThan(0);
+            await setReadCursorToId(vjt.token, NETWORK_SLUG, CHANNEL, cursorRow.id);
+            await loginAs(page, vjt);
+            await selectChannel(page, NETWORK_SLUG, CHANNEL);
+            const bar = page.locator('[data-testid="far-behind-bar"]');
+            const marker = page.locator('[data-testid="unread-marker"]');
+            await expect(marker).toBeAttached({ timeout: OUTCOME_TIMEOUT_MS });
+            await expect(bar).toHaveCount(0);
+            // Scroll up into the read context. Not to the very top: that is the
+            // `loadMore` trigger, and a prepend would move `scrollTop` for reasons
+            // that have nothing to do with the bound.
+            await page.evaluate(() => {
+                const el = document.querySelector('[data-testid="scrollback"]');
+                if (el === null)
+                    throw new Error("#1229 spec: scrollback container missing");
+                el.scrollTop = Math.floor(el.scrollHeight * 0.25);
+            });
+            const before = await scrollGeometry(page);
+            expect(before.scrollTop).toBeGreaterThan(0);
+            expect(before.scrollHeight - before.scrollTop - before.clientHeight).toBeGreaterThan(SCROLL_TOLERANCE_PX);
+            // The settle writer runs on a debounce; give it its window and then
+            // prove it did NOT move the cursor. Forward-only refusal is what holds
+            // the precondition, so it is asserted, not assumed.
+            await expect
+                .poll(() => getReadCursor(vjt.token, NETWORK_SLUG, CHANNEL), {
+                timeout: OUTCOME_TIMEOUT_MS,
+            })
+                .toBe(cursorRow.id);
+            const oldestUnreadLine = page.locator(`.scrollback-line:has-text(${JSON.stringify(oldestUnread.body)})`);
+            const readContextLine = page.locator(`.scrollback-line:has-text(${JSON.stringify(readContextRow.body)})`);
+            await expect(oldestUnreadLine).toHaveCount(1);
+            await expect(readContextLine).toHaveCount(1);
+            // ── The gesture: one live row, which makes the protected region one
+            // past the ceiling.
+            peer.privmsg(CHANNEL, "the row that crosses the ceiling");
+            // (2) the state transition, seen from outside
+            await expect(bar).toBeVisible({ timeout: OUTCOME_TIMEOUT_MS });
+            // The count is how far behind the operator actually is, taken BEFORE the
+            // bite and so including the row that crossed — not the page still held.
+            //
+            // #2037 A moved the UNIT of that number, not its meaning: the banner now
+            // reports the MESSAGES bucket, the same partition the sidebar's bold
+            // pill carries, because a bar counting raw rows against a split badge is
+            // what #2037 was reported for. So the JOINs past the cursor come out
+            // (`presencePast`), the crossing PRIVMSG stays in, and this fixture's
+            // 201 raw rows read as 199. Derived rather than re-hardcoded: the
+            // contrast this assertion exists for is still "the accumulated distance,
+            // NOT the page still held", and the derivation keeps it anchored to
+            // `UNREAD_BOUND + 1` instead of quietly becoming a new magic number.
+            await expect(bar).toContainText(String(UNREAD_BOUND + 1 - presencePast));
+            await expect(marker).toHaveCount(0);
+            // (4) a PREFIX drop: both the oldest unread AND the read context above
+            // it are gone. The live row that crossed the ceiling is still there —
+            // the tail is never what leaves.
+            await expect(oldestUnreadLine).toHaveCount(0);
+            await expect(readContextLine).toHaveCount(0);
+            await expect(page.locator('.scrollback-line:has-text("the row that crosses the ceiling")')).toHaveCount(1);
+            // (3) THE RULING — "basta che lo scroll sia contiguo e non ci siano
+            // buchi". What the pane still holds must be an unbroken run of the
+            // channel as the server orders it: take the DOM's ids, find where the
+            // first one sits in the server's list, and require the rest to follow it
+            // one for one. A hole anywhere inside the retained range fails here, and
+            // nothing weaker can see one (see the moduledoc on global ids).
+            const serverIds = (await fetchAllMessagesAsc(vjt.token, NETWORK_SLUG, CHANNEL)).map((r) => r.id);
+            const domIds = await page.$$eval(".scrollback-line[data-msg-id]", (els) => els.map((el) => Number(el.dataset.msgId)));
+            expect(domIds.length).toBeGreaterThan(0);
+            const start = serverIds.indexOf(domIds[0]);
+            expect(start, "the pane's oldest row is not one the server served").toBeGreaterThanOrEqual(0);
+            expect(domIds, "the retained range has a hole in it").toEqual(serverIds.slice(start, start + domIds.length));
+        }
+        finally {
+            await peer.part(CHANNEL, "done");
+        }
+    });
+});

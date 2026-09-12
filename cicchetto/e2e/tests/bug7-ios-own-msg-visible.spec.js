@@ -1,0 +1,102 @@
+// BUG7 — own message not visible in scrollback after compose-send on
+// iOS WebKit (the iPhone 15 device emulation surface).
+//
+// Manual matrix: vjt opens cicchetto on a real iPhone, types in #spec-wN
+// compose box, hits send. Expected the row to appear in scrollback
+// within 2s (same invariant as M3 on chromium). Observed: the row
+// either doesn't appear, appears late, or scrolls out of the visible
+// viewport (covered by the virtual keyboard / hidden by overflow).
+//
+// **Outcome on Playwright iPhone 15 emulation: GREEN.** Once the
+// page-object grew a mobile-aware `selectChannel` (BottomBar tablist
+// instead of `.sidebar-network-section`) the spec reaches compose-send and
+// the own-msg renders within the 5s window — i.e. the bug does NOT
+// reproduce in headless WebKit + iPhone-15 viewport. The hypothesis
+// surface that *does* reproduce on real hardware (visualViewport
+// shrinkage on virtual-keyboard show, real keyboard chrome occlusion,
+// touch-action quirks the emulator doesn't model) lives outside the
+// emulator's faithful behavior. So the spec downgrades from
+// "regression-pin RED on prod head" to "positive guard rail":
+// it asserts the iOS-shaped input path (tap-to-focus, per-keystroke
+// type, tap send) round-trips through compose → WS → DOM on every
+// commit. A future real-iOS reproduction (manual tcpdump + real-
+// device DevTools-over-USB) is the path to the actual fix.
+//
+// Why a webkit + iPhone 15 device emulation, not just chromium: WebKit
+// + virtual-keyboard interactions are the trigger surface. Plain
+// chromium doesn't reproduce — M3 has been GREEN since bucket B.
+// Playwright's iPhone 15 device sets `isMobile: true`, `hasTouch:
+// true`, and a small viewport (393×852); we additionally use `tap`
+// (touch event) + `pressSequentially` (per-keystroke flush) to match
+// the real iOS path as closely as Playwright supports without an
+// actual keyboard appearance event.
+//
+// `@webkit` tag opts this spec into the `webkit-iphone-15` project
+// (playwright.config.ts grep). Default chromium project skips it.
+import { composeTextarea, loginAs, scrollbackDistanceFromBottom, scrollbackLine, selectChannel, } from "../fixtures/cicchettoPage";
+import { assertMessagePersisted } from "../fixtures/grappaApi";
+import { AUTOJOIN_CHANNELS, NETWORK_SLUG } from "../fixtures/seedData";
+import { expect, specNick, specUser, test } from "../fixtures/test";
+const CHANNEL = AUTOJOIN_CHANNELS[0];
+// Per-run unique tag so retries / parallel runs don't strict-mode-collide
+// with persisted prior-run rows in #spec-wN.
+const MESSAGE_BODY = `BUG7-ios: own-msg visibility @ ${crypto.randomUUID().slice(0, 8)}`;
+// Mirror of ScrollbackPane.SCROLL_BOTTOM_THRESHOLD_PX = 50 (not exported; kept
+// in lockstep by hand — same as issue168 / issue580).
+const SCROLL_BOTTOM_THRESHOLD_PX = 50;
+test("@webkit @touch BUG7 — own message visible in scrollback after iOS-shaped compose-send", async ({ page, }) => {
+    const vjt = specUser();
+    await loginAs(page, vjt);
+    await selectChannel(page, NETWORK_SLUG, CHANNEL, { ownNick: specNick() });
+    const ta = composeTextarea(page);
+    await expect(ta).toBeVisible();
+    // iOS-shaped input path: tap (touch event, not click) the textarea
+    // to focus it — this is what triggers virtual-keyboard show on a
+    // real device. Playwright's iPhone 15 device emulation has
+    // `hasTouch: true` so `tap()` dispatches a real Touch event chain
+    // (touchstart/touchend) rather than synthesizing a mouse click.
+    await ta.tap();
+    // Type via per-keystroke events (pressSequentially) instead of
+    // bulk fill — matches the real iOS keystroke cadence and surfaces
+    // any per-keystroke reactivity glitches that bulk-fill would mask.
+    await ta.pressSequentially(MESSAGE_BODY, { delay: 20 });
+    // Submit. On iOS the user taps a "send" button (no Enter on virtual
+    // keyboard); locate by accessible name (UX-6-F replaced text label
+    // with ➤ glyph but kept aria-label="send message").
+    const sendButton = page.getByRole("button", { name: /send message/i });
+    await sendButton.tap();
+    // Compose box clears on successful submit (compose.ts post-send draft
+    // clear). This is the synchronous signal the slash-command / privmsg
+    // dispatcher consumed the input.
+    await expect(ta).toHaveValue("", { timeout: 5_000 });
+    // First door: server-side persistence. If THIS fails, the bug is in
+    // the request path (network, WS, server) — not iOS render. If this
+    // passes but the next assert fails, the bug is iOS-render-side.
+    await assertMessagePersisted({
+        token: vjt.token,
+        networkSlug: NETWORK_SLUG,
+        channel: CHANNEL,
+        sender: specNick(),
+        body: MESSAGE_BODY,
+    });
+    // Second door: own row appears in DOM AND is visible (not just
+    // attached). `toBeVisible` checks `offsetParent`, computed style,
+    // and viewport intersection — so a row that's rendered but
+    // virtual-keyboard-occluded or overflow-clipped fails this. The
+    // 2s window from the plan: own-msg should round-trip through the
+    // WS fastlane and paint within 2s on a healthy iOS WebKit. Generous
+    // 5s here matches the rest of the suite's WS poll ceiling.
+    const ownRow = scrollbackLine(page, "privmsg", MESSAGE_BODY);
+    await expect(ownRow).toBeVisible({ timeout: 5_000 });
+    // #608 STEP 6 STRENGTHEN — after the measured settle the OWN sent row must be
+    // at the TRUE tail, not merely attached / partially on screen. `toBeVisible`
+    // (offsetParent + any viewport intersection) passed even when the row sat one
+    // line BELOW the fold — the #608 §5 off-by-one, where the pre-append/rAF×2
+    // scroll landed on the previous line. `toBeInViewport` (full intersection) +
+    // distance-to-tail within threshold pin that the send tailed to the real
+    // bottom once the echo laid out. NEVER weaken these, NEVER inflate the poll.
+    await expect(ownRow).toBeInViewport();
+    await expect
+        .poll(async () => (await scrollbackDistanceFromBottom(page)) ?? 999)
+        .toBeLessThanOrEqual(SCROLL_BOTTOM_THRESHOLD_PX);
+});

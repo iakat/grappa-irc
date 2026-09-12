@@ -1,0 +1,273 @@
+// CP23 S4 B5 — bundle refresh banner e2e.
+//
+// Drives the `__cic_bundleHash` black-box hook to simulate the
+// server pushing a hash that differs from the one the page booted
+// with. Asserts the banner appears, contains the refresh CTA, and
+// that clicking the button triggers `window.location.reload()`.
+//
+// Reproducing a real cicchetto-build mid-session would require
+// running the prod oneshot + waiting for nginx to serve the new
+// bundle from runtime/cicchetto-dist — way out of scope for an e2e
+// run. The banner's job is to render the bootBundleHash != serverHash
+// invariant, which this spec validates end-to-end.
+import { awaitServerBundleHashPush, awaitServiceWorkerActive, loginAs, } from "../fixtures/cicchettoPage";
+import { expect, specUser, test } from "../fixtures/test";
+// #119 — the bundle-refresh banner folded into the unified stacked error
+// region as one typed source; it renders as a `.error-banner` slot with
+// data-source="bundle-refresh". Observable behavior (banner shows on hash
+// mismatch, button reloads) is unchanged.
+const BANNER_SELECTOR = '.error-banner[data-source="bundle-refresh"]';
+// #485 — every test here drives the bundle-refresh banner (a module
+// singleton `serverBundleHash` signal), so each MUST await the real
+// service worker's first activation before touching that state, else the
+// SW's boot-time autoUpdate reload wipes it and the banner assertion
+// times out. Shared gate + full rationale: `awaitServiceWorkerActive` in
+// ../fixtures/cicchettoPage.
+test("BundleRefreshBanner appears on hash mismatch and click reloads the page", async ({ page, }) => {
+    await loginAs(page, specUser());
+    await awaitServiceWorkerActive(page);
+    await awaitServerBundleHashPush(page);
+    // Banner must NOT render before any server hash is known.
+    await expect(page.locator(BANNER_SELECTOR)).toHaveCount(0);
+    const bootHash = await page.evaluate(() => {
+        const bh = window.__cic_bundleHash;
+        if (!bh)
+            throw new Error("__cic_bundleHash hook missing");
+        return bh.bootHash();
+    });
+    // Vite-built page MUST expose a boot hash via the script tag.
+    // If this null-check trips, the e2e is running against a non-built
+    // surface and the banner contract isn't observable.
+    expect(bootHash).not.toBeNull();
+    expect(typeof bootHash).toBe("string");
+    // Push a synthetic differing hash from the "server".
+    await page.evaluate(() => {
+        window.__cic_bundleHash?.setServerHash("synthetic-mismatch-hash-9999");
+    });
+    const banner = page.locator(BANNER_SELECTOR);
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("New version available");
+    // Set up navigation listener BEFORE clicking — the click triggers
+    // window.location.reload() which fires Page navigation in
+    // Playwright.
+    const navPromise = page.waitForNavigation();
+    // Click the Refresh action specifically — #207 added a sibling ×
+    // dismiss button to every banner, so a bare `button` locator is
+    // ambiguous. `.error-banner-action` is the CTA.
+    await banner.locator(".error-banner-action").click();
+    await navPromise;
+    // After reload, banner is gone (server hasn't pushed yet, and the
+    // boot hash matches whatever the page is running under).
+    await expect(page.locator(BANNER_SELECTOR)).toHaveCount(0);
+});
+test("refresh bar shows current vs available version, refresh still applies (#292)", async ({ page, }) => {
+    await loginAs(page, specUser());
+    await awaitServiceWorkerActive(page);
+    await awaitServerBundleHashPush(page);
+    await expect(page.locator(BANNER_SELECTOR)).toHaveCount(0);
+    const boot = await page.evaluate(() => {
+        const bh = window.__cic_bundleHash;
+        if (!bh)
+            throw new Error("__cic_bundleHash hook missing");
+        return { hash: bh.bootHash(), version: bh.bootVersion() };
+    });
+    // The vite build MUST bake the <meta name="cicchetto-version"> tag, so the
+    // running version is observable end-to-end. If this trips, the meta
+    // injection regressed (the whole current-vs-available display depends on it).
+    expect(boot.version).not.toBeNull();
+    expect(typeof boot.version).toBe("string");
+    expect(boot.hash).not.toBeNull();
+    // Server advertises a DIFFERENT semver + hash (a real release).
+    await page.evaluate(() => {
+        const bh = window.__cic_bundleHash;
+        bh?.setServerVersion("99.0.0");
+        bh?.setServerHash("synthetic-release-hash-0001");
+    });
+    const banner = page.locator(BANNER_SELECTOR);
+    await expect(banner).toBeVisible();
+    const message = banner.locator(".error-banner-message");
+    // Both the running version and the available version are visible, side by
+    // side — the #292 ask. A real version bump shows clean semvers, no hash.
+    await expect(message).toContainText(`current ${boot.version}`);
+    await expect(message).toContainText("available 99.0.0");
+    // The refresh button STILL applies the update (reload) — the existing CTA
+    // is preserved.
+    const navPromise = page.waitForNavigation();
+    await banner.locator(".error-banner-action").click();
+    await navPromise;
+    await expect(page.locator(BANNER_SELECTOR)).toHaveCount(0);
+});
+test("refresh bar appends the short build hash when the semver is unchanged (#292)", async ({ page, }) => {
+    await loginAs(page, specUser());
+    await awaitServiceWorkerActive(page);
+    await awaitServerBundleHashPush(page);
+    await expect(page.locator(BANNER_SELECTOR)).toHaveCount(0);
+    const boot = await page.evaluate(() => {
+        const bh = window.__cic_bundleHash;
+        if (!bh)
+            throw new Error("__cic_bundleHash hook missing");
+        return { hash: bh.bootHash(), version: bh.bootVersion() };
+    });
+    expect(boot.version).not.toBeNull();
+    expect(boot.hash).not.toBeNull();
+    // Same semver on both sides (a trivial rebuild with no version bump), but a
+    // different build hash. The refresh bar must still show a concrete diff via
+    // the short (7-char) hash suffix, so the "changed" signal never goes dead.
+    await page.evaluate((bootVersion) => {
+        const bh = window.__cic_bundleHash;
+        bh?.setServerVersion(bootVersion);
+        bh?.setServerHash("trivialrebuildhash999999");
+    }, boot.version);
+    const message = page.locator(`${BANNER_SELECTOR} .error-banner-message`);
+    await expect(message).toBeVisible();
+    // Same version, disambiguated by the hash suffix on both sides.
+    await expect(message).toContainText(`${boot.version} (`);
+    // First 7 chars of the synthetic server hash.
+    await expect(message).toContainText("trivial");
+});
+test("BundleRefreshBanner stays hidden when server pushes the same hash", async ({ page }) => {
+    await loginAs(page, specUser());
+    await awaitServiceWorkerActive(page);
+    await awaitServerBundleHashPush(page);
+    await expect(page.locator(BANNER_SELECTOR)).toHaveCount(0);
+    await page.evaluate(() => {
+        const bh = window.__cic_bundleHash;
+        if (!bh)
+            throw new Error("__cic_bundleHash hook missing");
+        const boot = bh.bootHash();
+        if (boot === null)
+            throw new Error("boot hash unexpectedly null");
+        bh.setServerHash(boot);
+    });
+    // Same hash = no mismatch = no banner.
+    await expect(page.locator(BANNER_SELECTOR)).toHaveCount(0);
+});
+test("UX-6-I — refresh button forces SW update + cache purge before reload", async ({ page }) => {
+    // UX-6-I: pre-fix vjt observed it took THREE refresh-button presses
+    // on iPhone PWA to actually pick up a new bundle. Root cause: SW's
+    // precacheAndRoute serves the OLD precached index.html until the
+    // new SW finishes install + activate + claim (multiple navigate
+    // cycles of latency). Post-fix `performRefresh` calls
+    // `registration.update()`, posts SKIP_WAITING to any waiting SW,
+    // purges caches, THEN reloads — so the next navigate hits the
+    // network and lands on the fresh bundle in ONE press.
+    //
+    // We instrument the SW API + caches API on the page side so the
+    // click handler's interactions are observable from the test
+    // without needing a real cic-bundle-changed deploy mid-spec. The
+    // unit tests in bundleHash.test.ts cover the branching exhaustively;
+    // this e2e validates the BROWSER actually invokes the patched path
+    // when the live button is clicked.
+    await loginAs(page, specUser());
+    // Gate on the real SW activation BEFORE stubbing SW state and clicking
+    // — this UX-6-I case is the deterministic one: the stub below overwrites
+    // `navigator.serviceWorker.controller` with a fake "activated" object
+    // while the real SW is still registering, so a late real activation is
+    // read as an UPDATE by workbox-window and reloads mid-click. See
+    // `awaitServiceWorkerActive` in ../fixtures/cicchettoPage for the full
+    // mechanism.
+    await awaitServiceWorkerActive(page);
+    await awaitServerBundleHashPush(page);
+    await expect(page.locator(BANNER_SELECTOR)).toHaveCount(0);
+    // Install instrumentation BEFORE setting the server hash so the
+    // click handler picks up our stubs. We can't stub `serviceWorker`
+    // (read-only on Navigator), so we stub `getRegistration` directly
+    // and record invocations on a window-scoped probe.
+    await page.evaluate(() => {
+        const probe = {
+            updateCalls: 0,
+            waitingSkipCalls: 0,
+            cacheDeletes: [],
+            reloaded: false,
+        };
+        window.__ux6i_probe = probe;
+        // Stub SW registration. The underlying `navigator.serviceWorker`
+        // object is read-only so we monkey-patch `getRegistration` only +
+        // the `controller` field + the `addEventListener`/`removeEventListener`
+        // pair (controllerchange await path, UX-6-I reviewer H1 fix).
+        if ("serviceWorker" in navigator) {
+            const fakeWaiting = {
+                postMessage: (msg) => {
+                    if (msg?.type === "SKIP_WAITING") {
+                        probe.waitingSkipCalls++;
+                    }
+                },
+            };
+            const fakeReg = {
+                update: async () => {
+                    probe.updateCalls++;
+                },
+                waiting: fakeWaiting,
+                installing: null,
+            };
+            const swContainer = navigator.serviceWorker;
+            // `getRegistration` resolves a real `ServiceWorkerRegistration`, which
+            // `fakeReg` deliberately is not (the stub carries only the three members
+            // `performRefresh` touches). Intersecting a narrower signature onto the
+            // container makes the property's type the intersection of BOTH return
+            // types, which nothing satisfies — so install it the same way
+            // `controller` below is installed, by definition rather than assignment.
+            Object.defineProperty(swContainer, "getRegistration", {
+                configurable: true,
+                value: async () => fakeReg,
+            });
+            Object.defineProperty(swContainer, "controller", {
+                configurable: true,
+                value: { state: "activated" },
+            });
+            // Fire controllerchange immediately so performRefresh's wait
+            // resolves without ticking the 2s ceiling. The real flow ALSO
+            // hits this listener once the new SW claims, so this mirrors
+            // production timing — minus the 2s upper bound.
+            swContainer.addEventListener = (event, handler) => {
+                if (event === "controllerchange") {
+                    queueMicrotask(() => handler(new Event("controllerchange")));
+                }
+            };
+            swContainer.removeEventListener = () => undefined;
+        }
+        // Stub caches API to record deletion calls.
+        if ("caches" in window) {
+            window.caches.keys = async () => ["workbox-precache-v2-https://test/", "workbox-runtime"];
+            window.caches.delete = async (key) => {
+                probe.cacheDeletes.push(key);
+                return true;
+            };
+        }
+        // Replace the reload step with the probe seam (UX-6-I). The
+        // production code path always reloads; the seam exists ONLY so
+        // this e2e can observe the chain without navigating out of the
+        // test page. `window.location.reload` is non-configurable on
+        // chromium so a prototype patch is silently ignored — the seam
+        // is the supported substitute.
+        const bh = window.__cic_bundleHash;
+        if (!bh)
+            throw new Error("__cic_bundleHash missing");
+        bh.__refreshProbe = () => {
+            probe.reloaded = true;
+        };
+    });
+    // Push synthetic mismatch → banner appears.
+    await page.evaluate(() => {
+        window.__cic_bundleHash?.setServerHash("ux-6-i-mismatch-hash");
+    });
+    const banner = page.locator(BANNER_SELECTOR);
+    await expect(banner).toBeVisible();
+    // Single click; allow async performRefresh chain to settle. Target the
+    // Refresh action specifically — #207 added a sibling × dismiss button.
+    await banner.locator(".error-banner-action").click();
+    // Wait for the reload stub to be invoked. performRefresh awaits
+    // SW + caches before reload, so the probe transitions from
+    // reloaded:false to reloaded:true once the chain completes.
+    await page.waitForFunction(() => window.__ux6i_probe?.reloaded, null, { timeout: 5_000 });
+    const probe = await page.evaluate(() => {
+        return window.__ux6i_probe;
+    });
+    expect(probe?.reloaded).toBe(true);
+    expect(probe?.updateCalls).toBe(1);
+    expect(probe?.waitingSkipCalls).toBe(1);
+    // Both stub caches must be deleted (workbox-precache + runtime).
+    expect(probe?.cacheDeletes.length).toBe(2);
+    expect(probe?.cacheDeletes).toContain("workbox-precache-v2-https://test/");
+    expect(probe?.cacheDeletes).toContain("workbox-runtime");
+});

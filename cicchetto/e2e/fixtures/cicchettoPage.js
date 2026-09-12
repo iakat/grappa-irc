@@ -1,0 +1,1516 @@
+// Page-object surface for the cicchetto SPA, used by every Mi spec.
+//
+// Why a page-object and not raw Playwright locators in each spec:
+//   - login flow has THREE steps (seed two localStorage keys + goto +
+//     wait for shell ready). Repeating that across 12 specs means 12
+//     places to update if cicchetto's bootstrap changes.
+//   - locator naming is a stable contract. If a CSS class changes,
+//     update the helper here, NOT every spec.
+//   - the contract surface (selectChannel, sidebarChannel, etc.) reads
+//     like the irssi M1-M12 vocabulary, so spec bodies stay narrative.
+//
+// Auth-seed shape (loginAs):
+//   localStorage["grappa-token"]   = bearer token
+//   localStorage["grappa-subject"] = JSON.stringify(subject)
+// Both keys are required — cicchetto's auth.ts reads BOTH at module
+// init (token in the createSignal default, subject in getSubject).
+// The `grappa-subject` value drives socketUserName(), which in turn
+// drives the WS topic prefix the channel join uses for authorization.
+// Missing it = `forbidden` reject from authorize/2 server-side.
+//
+// Selector contract (kept in lockstep with cicchetto/src/Sidebar.tsx +
+// BottomBar.tsx + ScrollbackPane.tsx + ComposeBox.tsx):
+//
+//   Desktop sidebar (viewport > 768px — Shell.tsx desktop branch):
+//     .sidebar-network-section li — one per sidebar window (server, channel, query)
+//     .sidebar-window-btn        — the clickable name button inside <li>
+//     .sidebar-channel-name      — the visible window name span
+//     .sidebar-msg-unread        — message-unread badge (when > 0)
+//     .sidebar-events-unread     — event-unread badge (when > 0)
+//     .sidebar-mention           — `@N` mention badge (when > 0)
+//     .sidebar-close             — × close button (channel + query only)
+//
+//   Mobile bottom-bar (viewport ≤ 768px — Shell.tsx mobile branch
+//   replaces the sidebar entirely with <BottomBar />):
+//     .bottom-bar                — role="tablist" container
+//     .bottom-bar-network        — per-network grouping
+//     .bottom-bar-network-header — clickable server-window entry (emoji + slug)
+//                                  carrying data-network-slug="<slug>"
+//     .bottom-bar-tab + .bottom-bar-close — flat siblings (channel/query tab + ×)
+//     .bottom-bar-tab            — clickable window button (server-header/channel/query)
+//     .bottom-bar-close          — × close button (iOS-3 channel/query + UX-4-D
+//                                  disconnect × sibling of the server-header)
+//     .bottom-bar-msg-unread / -events-unread / -mention — badges
+//
+//   Shared:
+//     [data-testid="scrollback"] — scrollback list container
+//     [data-testid="scrollback-line"] — per-message row (data-kind=privmsg|action|join|...)
+//     .compose-box textarea      — the compose textarea
+//
+// Channel-bound assertions key off the visible name (`#bofh`,
+// `vjt-peer`). Window items are scoped per-network: desktop via
+// `.sidebar-network-section` matched by `.sidebar-network-header` text;
+// mobile via `.bottom-bar-network` matched by
+// `.bottom-bar-network-header[data-network-slug=...]`. Same uniqueness
+// guarantee holds on both layouts.
+//
+// Viewport branching: helpers that need to render against the right
+// layout (loginAs shell-ready, sidebarWindow, selectChannel click)
+// detect mobile via `isMobileViewport(page)`. Threshold mirrors
+// cicchetto/src/lib/theme.ts MOBILE_QUERY = `(max-width: 768px)`.
+// Playwright's iPhone 15 device has viewport 393×852 → mobile branch.
+import { expect, } from "@playwright/test";
+import { scrollByGesture, waitForScrollRest } from "./scrollGesture";
+import { describeUserTopicTimeout, watchPageConsole } from "./userTopicDiagnostics";
+const SHELL_READY_TIMEOUT_MS = 10_000;
+// #1579 — see `waitForUserTopicReady` for why this number does not move.
+const USER_TOPIC_BARRIER_MS = 5_000;
+const MOBILE_BREAKPOINT_PX = 768;
+// Mirror of cicchetto/src/lib/theme.ts isMobile() — viewport width
+// at-or-below 768px is the mobile branch in Shell.tsx. Playwright sets
+// viewport via `devices["iPhone 15"]` (393×852) for the
+// webkit-iphone-15 project; the desktop chromium project gets the
+// default 1280×720 from devices["Desktop Chrome"].
+function isMobileViewport(page) {
+    const sz = page.viewportSize();
+    return sz !== null && sz.width <= MOBILE_BREAKPOINT_PX;
+}
+// #500 — "the authed shell has hydrated" gate, form-factor-agnostic and
+// network-independent.
+//
+// Specs that inject a bearer and `goto("/")` need a signal that the SPA has
+// booted into the authed Shell before they interact. Pre-#500 many hand-rolled
+// this as `expect(getByLabel(/open settings/i)).toBeVisible()` — the settings
+// cog doubled as the "app is up" marker. #500 moved the cog behind the
+// RailActions launcher (unmounted until the launcher is tapped) AND the launcher
+// itself lives inside the mobile members drawer (hidden until opened), so
+// NEITHER is a valid ready signal any more. `.shell-main` is the authed main
+// content region: rendered unconditionally in BOTH Shell branches (desktop +
+// mobile), never inside a `<Show>`/drawer, and mounted only under `<RequireAuth>`
+// — so its visibility means exactly "authed shell rendered", independent of
+// viewport or whether any network is bound (admin-vjt has zero). This is the
+// honest intent — app ready, not cog.
+export async function expectShellReady(page) {
+    await expect(page.locator(".shell-main")).toBeVisible({
+        timeout: SHELL_READY_TIMEOUT_MS,
+    });
+}
+// The ONE door that puts a bearer + subject envelope into localStorage
+// before first paint. `addInitScript` runs BEFORE any page script, so the
+// values are there when auth.ts's `createSignal` default reads the token
+// and `getSubject()` reads the subject; doing this via `page.evaluate`
+// AFTER goto would race the SPA's first read.
+async function seedAuthLocalStorage(page, token, subjectJson) {
+    // #1579 — start recording the page console before the first navigation, so
+    // a later `waitForUserTopicReady` timeout can quote the phoenix-level join
+    // errors instead of leaving them in a container log nobody reads. Costs one
+    // listener; the page is not modified.
+    watchPageConsole(page);
+    await page.addInitScript(([t, s]) => {
+        localStorage.setItem("grappa-token", t);
+        localStorage.setItem("grappa-subject", s);
+        localStorage.setItem("cic.installChoice", "browser");
+    }, [token, subjectJson]);
+}
+// Seed a token + subject into localStorage so cicchetto boots already
+// authenticated, then load the SPA and wait for the shell to be ready
+// (sidebar/bottom-bar populated with at least one network section).
+//
+// Also seeds `cic.installChoice = "browser"` to suppress the install
+// splash (push notifications cluster B0 — splash overlays the UI on
+// every fresh visit until the user picks "Install app" or "Continue
+// from browser"). Existing e2e specs predate the splash and expect a
+// chrome-free first paint; rather than have every spec dismiss the
+// splash, the test seam mirrors the production "user has chosen
+// browser-only mode" branch via the same localStorage key.
+export async function loginAs(page, vjt, opts = {}) {
+    await seedAuthLocalStorage(page, vjt.token, vjt.subjectJson);
+    await page.goto("/");
+    // Shell-ready signal: a per-network section appears once the
+    // `networks()` resource resolves. Selector differs by layout —
+    // desktop renders the collapsed network/server header row
+    // (`.sidebar-network-header` since UX-4 bucket C; pre-C was a
+    // `<h3>` per network), mobile renders `.bottom-bar-network-header`
+    // (UX-6-E merged the old chip + standalone Server tab; the header
+    // IS the server-window entry now). The `.sidebar-network-section`
+    // DOM is absent entirely in the mobile JSX branch, so a single
+    // OR-style selector would be more brittle than a viewport-
+    // conditioned one.
+    //
+    // UX-7-C (2026-05-22) — opt-in for accounts that will render NO network
+    // row, where the per-network-header selector waits forever; switch to the
+    // registered home pane, which is the post-/me steady state for them. Opt-in
+    // rather than OR-selector because `.home-pane-registered` can RACE in front
+    // of the network section for normal bound users (homeData resolves off /me
+    // alone; network sidebar/bottom-bar wait for /networks + /channels) —
+    // weakening the post-loginAs invariant from "shell fully populated" to "DOM
+    // has homepane scaffolding". Callers that immediately interact with
+    // sidebar/bottom-bar windows would race, so pass this ONLY when the spec
+    // stays on the home pane.
+    //
+    // issue 1985 — named `noSidebarNetworks`, not `noNetworks`, because there
+    // are now TWO ways to get here and the old name is false for the second.
+    // UX-7-C's case is "the account has no credential bound at all" (M-7's
+    // admin-vjt). The new one is "every network the account HAS is `parked`",
+    // which since issue 1985 draws no sidebar row either — the network exists,
+    // it is simply not a window right now, and `$home` is where it lives (with
+    // its [Reconnect] chip). The gate never cared which of the two it was: what
+    // it selects on is whether a network header will ever appear, so the name
+    // says that and one opt covers both.
+    if (opts.noSidebarNetworks === true) {
+        await expect(page.locator(".home-pane-registered").first()).toBeVisible({
+            timeout: SHELL_READY_TIMEOUT_MS,
+        });
+        await waitForUserTopicReady(page, vjt.name);
+        return;
+    }
+    const readySelector = isMobileViewport(page)
+        ? ".bottom-bar-network-header"
+        : ".sidebar-network-header";
+    await expect(page.locator(readySelector).first()).toBeVisible({
+        timeout: SHELL_READY_TIMEOUT_MS,
+    });
+    // Gate on the user-topic WS subscribe completing — without this,
+    // compose-driven specs that fire `/join` immediately after loginAs
+    // race the JOIN ack and miss the server's window_pending +
+    // join_failed broadcasts (Phoenix.PubSub doesn't replay to late
+    // subscribers). See `waitForUserTopicReady` for the full why.
+    await waitForUserTopicReady(page, vjt.name);
+}
+// Admin sibling of `loginAs`: the same `seedAuthLocalStorage` seeding,
+// gated on `expectShellReady` instead of the per-network header +
+// user-topic ack above.
+//
+// #1397 — this replaces twenty local copies that lived in twenty spec
+// files under two names (`adminLogin` x12, `adminFriendlyLogin` x8).
+// The two names were synonyms: with the name masked, every body runs
+// the same three statements. All the variance sat in the SIGNATURE, on
+// two axes — the seed type was spelled three ways (`SeededUser`,
+// `ReturnType<typeof getSeededAdmin>`, a local `Admin`, which are one
+// type since `getSeededAdmin(): SeededUser`), and four of the twenty
+// fetched the seed themselves rather than taking it, which is why
+// fourteen call sites now spell `getSeededAdmin()` out loud.
+//
+// Deliberately NOT `loginAs`, though the seeding half is now literally
+// the same call. The seeded admin (`admin-vjt`) has NO networks bound,
+// so `loginAs`'s per-network-header selector never resolves for it;
+// reaching it would mean `noSidebarNetworks: true`, whose own comment above
+// calls that a weakening of the post-login invariant. Adopting
+// `loginAs` would also buy `waitForUserTopicReady`, which none of the
+// twenty specs needs today — none of them composes `/join` — and which
+// rests on `socketUserName()` matching the seeded admin name,
+// unverified at the time of writing. The barrier question is open, not
+// settled: see DESIGN_NOTES 2026-08-18.
+export async function adminLogin(page, admin) {
+    await seedAuthLocalStorage(page, admin.token, admin.subjectJson);
+    await page.goto("/");
+    await expectShellReady(page);
+}
+// Seed a visitor session onto an EXISTING page and load the SPA.
+//
+// The readiness gate is deliberately NOT part of this verb: it genuinely
+// differs per spec (`.shell-main`, the mobile bottom-bar header, a
+// user-topic subscribe, or none at all for the #477 rail specs), and
+// folding four variants behind an enum would bury a real per-spec intent
+// under a shared default. Callers await their own signal.
+export async function bootVisitor(page, visitor) {
+    const subject = { kind: "visitor", id: visitor.id };
+    if (visitor.registered !== undefined)
+        subject.registered = visitor.registered;
+    if (visitor.incognito !== undefined)
+        subject.incognito = visitor.incognito;
+    await seedAuthLocalStorage(page, visitor.token, JSON.stringify(subject));
+    await page.goto("/");
+}
+// `bootVisitor` on a context of its own — the shape the browser-level
+// specs need, where each visitor gets an isolated localStorage. Returns
+// the context so the caller can close it.
+export async function bootVisitorContext(browser, visitor) {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await bootVisitor(page, visitor);
+    return { ctx, page };
+}
+// Sidebar / bottom-bar accessors ────────────────────────────────────
+// One window row by visible name, scoped to a network section.
+// On desktop returns the `<li>` inside `.sidebar-network-section`;
+// on mobile returns the `.bottom-bar-tab` inside `.bottom-bar-network`.
+// Callers (close button click, badge lookup, count assertions) treat
+// both as "the per-window container" — the badge selectors below
+// mirror the branching so a `.toHaveCount(1)` assertion works
+// identically on either layout.
+//
+// GREEN-CI-3 B2 (2026-05-23) — match exact window name via the
+// production `data-window-name` attribute (added on every sidebar
+// `<li>` + every `.bottom-bar-tab`). Pre-fix this helper matched on
+// `hasText: windowName` substring, which double-matched on any name
+// that was a prefix of another (`#bofh` ⊂ `#bofh-test`, `peer` ⊂
+// `peer2`) — combined with Playwright's default `.first()` for
+// ambiguous locators, the collision returned a non-deterministic
+// row. The attribute is a stable test seam (same pattern as the
+// existing `data-network-slug` + `data-testid` + `data-kind` ones);
+// production behavior unchanged.
+export function sidebarWindow(page, networkSlug, windowName) {
+    // Server-window legacy ergonomics: callers historically pass one of
+    //   - "Server" (pre-UX-4-C label)
+    //   - the literal network slug (UX-4-C / UX-6-E callers that
+    //     identify the server tab by the slug it renders alongside the
+    //     ⚙️ emoji)
+    // The production tag now uses SERVER_WINDOW_NAME = "$server" on the
+    // network-header row's data-window-name attribute; map both legacy
+    // shapes → "$server" here so spec callers don't have to know the
+    // storage shape.
+    const isServerWindow = windowName === "Server" || windowName === networkSlug;
+    const resolvedName = isServerWindow ? "$server" : windowName;
+    const attr = `[data-window-name="${resolvedName}"]`;
+    if (isMobileViewport(page)) {
+        // BottomBar.tsx: `.bottom-bar-network` group is identified by its
+        // `.bottom-bar-network-header[data-network-slug=...]` child
+        // (UX-6-E merged the old chip span + standalone Server tab into
+        // ONE clickable header that IS the server-window entry).
+        const section = page.locator(".bottom-bar-network", {
+            has: page.locator(`.bottom-bar-network-header[data-network-slug="${networkSlug}"]`),
+        });
+        // Server-window short-circuit: the network-header IS the server tab
+        // (UX-6-E merge). Selector by data-network-slug to mirror the
+        // section-anchor; data-window-name isn't authored on the header
+        // (the slug attribute already disambiguates it from channel/query
+        // tabs).
+        if (isServerWindow) {
+            return section.locator(`.bottom-bar-network-header[data-network-slug="${networkSlug}"]`);
+        }
+        // Channel + query tabs: exact match via data-window-name on the
+        // `.bottom-bar-tab` button. Exclude the network-header tab
+        // explicitly so a hypothetical attribute collision (server tab
+        // for a network whose slug equals a channel name) can't double-
+        // match.
+        return section.locator(`.bottom-bar-tab:not(.bottom-bar-network-header)${attr}`);
+    }
+    // Desktop: scope to the per-network `<ul>` by its production
+    // `aria-label` (`"<slug> windows"`), an EXACT attribute match.
+    //
+    // #1038 — this used to filter on the header row's `hasText: slug`,
+    // which is a SUBSTRING match, so `azzurra` also selected `azzurra2`
+    // and `azzurra-reg`. Existing specs survived by accident: two matched
+    // sections still yield one `<li>` as long as the window name exists in
+    // only one of them. The first spec to hold the SAME channel name on
+    // two networks (the whole point of #1038) got "resolved to 2 elements"
+    // instead. That is precisely the defect GREEN-CI-3 B2 fixed for the
+    // WINDOW half of this helper (`#bofh` ⊂ `#bofh-test`) and for the
+    // whole mobile branch above, which anchors on an exact
+    // `data-network-slug`; the desktop network half was simply never given
+    // the same treatment.
+    //
+    // No production change was needed: `Sidebar.tsx` already authors
+    // `aria-label={`${network.slug} windows`}` on this exact element, and
+    // it is the only site that emits `.sidebar-network-section`.
+    //
+    // UX-5 BH (2026-05-19): `.sidebar-network` was renamed to
+    // `.sidebar-network-section` when the legacy `<section>` wrapper was
+    // killed and the per-network `<ul>` took over carrying the class.
+    const section = page.locator(`.sidebar-network-section[aria-label="${networkSlug} windows"]`);
+    // FLAKE-B (2026-05-22) — same callsite shape as the mobile branch
+    // above. Post-UX-4-C the desktop sidebar network-header `<li>` IS
+    // the server-window entry; its visible text is `⚙️ <slug>` (NOT
+    // "Server"). Pre-fix `section.locator("li", { hasText: "Server" })`
+    // never matched and timed out at 30s — falsely attributed to
+    // "testnet load" in FLAKE-A. The `data-window-name="$server"`
+    // attribute on the header `<li>` (added GREEN-CI-3 B2) collapses
+    // both legacy callers ("Server") and explicit slug callers to the
+    // same exact-attribute match.
+    return section.locator(`li${attr}`);
+}
+export function sidebarMessageBadge(page, networkSlug, windowName) {
+    const cls = isMobileViewport(page) ? ".bottom-bar-msg-unread" : ".sidebar-msg-unread";
+    return sidebarWindow(page, networkSlug, windowName).locator(cls);
+}
+export function sidebarEventsBadge(page, networkSlug, windowName) {
+    const cls = isMobileViewport(page) ? ".bottom-bar-events-unread" : ".sidebar-events-unread";
+    return sidebarWindow(page, networkSlug, windowName).locator(cls);
+}
+export function sidebarMentionBadge(page, networkSlug, windowName) {
+    const cls = isMobileViewport(page) ? ".bottom-bar-mention" : ".sidebar-mention";
+    return sidebarWindow(page, networkSlug, windowName).locator(cls);
+}
+// iOS-3 — close × button for a channel/query window. Layout-aware:
+// desktop uses `.sidebar-close` (sibling of `.sidebar-window-btn`
+// inside `<li>`); mobile uses `.bottom-bar-close` — IMMEDIATELY
+// AFTER the matching `.bottom-bar-tab` in the bottom-bar's flex
+// layout (post-UX-3-DEC the wrapping <span> is dropped; tab + close
+// are direct flex siblings). Server windows have NO close button
+// on either layout — caller is responsible for only calling this
+// on channel/query windows.
+export function sidebarCloseButton(page, networkSlug, windowName) {
+    if (isMobileViewport(page)) {
+        const section = page.locator(".bottom-bar-network", {
+            has: page.locator(`.bottom-bar-network-header[data-network-slug="${networkSlug}"]`),
+        });
+        // The tab + close are now flat siblings; locate the tab by text,
+        // then walk to the next sibling close × via xpath following-sibling.
+        return section.locator(`.bottom-bar-tab:has-text("${windowName}") + .bottom-bar-close`);
+    }
+    return sidebarWindow(page, networkSlug, windowName).locator(".sidebar-close");
+}
+// #195 — the destructive close × (leave channel / disconnect network) opens
+// an explicit confirm modal (ConfirmModal.tsx / lib/confirmDialog.ts). The
+// #172 hold-to-close gesture was REMOVED (on touch it read as a broken × —
+// see the #195 field reports). A plain click on the × surfaces the modal;
+// these helpers drive its two outcomes.
+export function confirmModal(page) {
+    return page.locator('[data-testid="confirm-modal"]');
+}
+// The modal's question text (body) — includes the interpolated channel /
+// network name so a spec can assert the right target is being confirmed.
+export function confirmModalBody(page) {
+    return page.locator('[data-testid="confirm-modal-body"]');
+}
+// Affirmative confirm — fires the carried close action (PART / park).
+export async function confirmModalYes(page) {
+    await page.locator('[data-testid="confirm-modal-confirm"]').click();
+}
+// Cancel — dismisses WITHOUT firing (the safe, non-destructive default).
+export async function confirmModalCancel(page) {
+    await page.locator('[data-testid="confirm-modal-cancel"]').click();
+}
+// #816 — the optional THIRD button: a different route to what the operator
+// wanted, offered beside Cancel and the affirmative (the paste guard's
+// "Upload as .txt"). A Locator, not a click helper, so a spec can also assert
+// its ABSENCE on a plain two-button dialog.
+export function confirmModalAlternative(page) {
+    return page.locator('[data-testid="confirm-modal-alternative"]');
+}
+// Click the window to focus it. Solid's reactive flush + the shell's
+// auto-close-sidebar effect happen synchronously; the channel becomes
+// selected before this resolves.
+//
+// Layout-aware click target: desktop uses `.sidebar-window-btn` inside
+// the `<li>`; mobile clicks the `.bottom-bar-tab` directly (no inner
+// button — the tab IS the button).
+//
+// `awaitWsReady` (default `true`): after focus, wait for WS readiness
+// via TWO signals (both required when `ownNick` is passed):
+//   1. The auto-joined own-nick JOIN line rendering in scrollback —
+//      proves the initial scrollback REST fetch landed + seeded.
+//   2. The `__cic_channelReady` seam (waitForChannelReady) — proves the
+//      per-channel `phx.join()` ACK'd, i.e. the socket is SUBSCRIBED.
+// #79 correction: signal (1) alone is NOT sufficient. The JOIN line is a
+// boot-persisted row served by the initial REST /messages page, so it
+// renders before the WS join ACKs under full-suite load — a following
+// composeSend's own-echo then fastlanes past the not-yet-subscribed
+// socket (PubSub has no replay to late subscribers) and the row never
+// appears (observed: M1's peer PRIVMSG dropped; #79's own-echo dropped —
+// channel persisted the row, but no WS push reached the browser, DOM
+// assertion times out). Adding signal (2) here makes EVERY
+// selectChannel-then-send spec race-free at the shared fixture, not one
+// spec at a time. Pass `awaitWsReady: false` for the Server / DM / list /
+// mentions windows where the channels-loop join (and the JOIN line) do
+// not apply — AND for kicked / parked / failed channel windows: those are
+// not (re)joined by either subscribe.ts loop, so the seam is never stamped
+// for them, yet a historical self-JOIN row may still satisfy signal (1) —
+// leaving signal (2) to hang the full 10s. Signal (2) assumes the channel
+// is joined / pending / invited (a live or in-flight subscription).
+//
+// Own-nick is derived from the seed (NETWORK_NICK) — kept here as the
+// `ownNick` parameter rather than imported from seedData so this
+// helper has zero coupling to the seed-time constants beyond the
+// caller's own awareness.
+export async function selectChannel(page, networkSlug, windowName, opts = {}) {
+    const awaitWsReady = opts.awaitWsReady ?? true;
+    const target = sidebarWindow(page, networkSlug, windowName);
+    if (isMobileViewport(page)) {
+        // The tab IS the button on mobile — click it directly. Use tap()
+        // to match the touch event chain a real iOS user produces; the
+        // iPhone 15 device profile has hasTouch:true, so click() would
+        // fall back to a synthesized mouse event that the BottomBar
+        // tablist still handles, but tap() exercises the same path the
+        // production user does.
+        await target.tap();
+    }
+    else {
+        await target.locator(".sidebar-window-btn").click();
+    }
+    if (awaitWsReady && opts.ownNick) {
+        // Signal 1 — REST landed + seeded. The auto-joined self-JOIN line
+        // carries `<ownNick> has joined <channel>`. Match on both substrings
+        // so a peer's later JOIN to the same channel doesn't false-positive
+        // (peer nick differs).
+        await expect(page
+            .locator('[data-testid="scrollback-line"][data-kind="join"]')
+            .filter({ hasText: opts.ownNick })
+            .filter({ hasText: windowName })
+            .first()).toBeVisible({ timeout: 10_000 });
+        // Signal 2 — WS SUBSCRIBED (#79). The JOIN line above only proves the
+        // REST page landed; the channel `phx.join()` may still be in flight,
+        // so a following own-echo would be fastlaned to a not-yet-subscribed
+        // socket and dropped. Await the channels-loop join ACK seam.
+        await waitForChannelReady(page, networkSlug, windowName);
+    }
+}
+// Wait until cic's DM-listener has subscribed to the own-nick topic
+// for `networkSlug` (i.e. `phx.join()` ack landed for
+// `grappa:user:{userName}/network:{slug}/channel:{ownNick}`). Pure
+// test seam: subscribe.ts stamps `__cic_dmListenerReady` (a `Set<slug>`)
+// in the DM-listener join `onJoinOk` callback. Production never reads
+// it.
+//
+// Why: peer-driven specs that fire `peer.privmsg(NETWORK_NICK, …)`
+// IMMEDIATELY after `selectChannel(channel)` race the DM-listener
+// effect. `selectChannel` awaits the channel topic join, NOT the
+// own-nick topic join — those are sibling `createEffect`s gated on
+// `networks()` loading. If the peer's PRIVMSG lands before the
+// own-nick subscribe completes, the server broadcast fan-outs to
+// zero subscribers and the DM-listener handler never fires →
+// no `openQueryWindowState` → no sidebar window → no auto-open. ~20%
+// flake observed in suite pre-fix.
+//
+// Shape mirrors the inline pattern UX-6-L introduced
+// (`ux-6-l-foreground-push-beep.spec.ts:81`); factored here once
+// CP14-B3 needed the same guard (FLAKE-D triage 2026-05-23).
+export async function waitForDmListenerReady(page, networkSlug) {
+    await page.waitForFunction((slug) => {
+        const set = window
+            .__cic_dmListenerReady;
+        return set?.has(slug) === true;
+    }, networkSlug, { timeout: 5_000 });
+}
+// Wait until cic's query-window loop has subscribed to a SPECIFIC DM
+// peer's per-channel topic (`phx.join()` ack landed for
+// `grappa:user:{u}/network:{slug}/channel:{targetNick}`). Pure test
+// seam: subscribe.ts stamps `__cic_queryWindowReady` (a Set of
+// `${slug}/${targetNick}`) in the query-window join `onJoinOk`.
+// Production never reads it.
+//
+// Why: the server broadcasts the operator's OWN outbound `/msg
+// <peer>` echo on the (slug, peer) topic. A spec that opens a DM via
+// `/query <peer>` then IMMEDIATELY composeSends an own line races the
+// query-window subscribe — the echo fastlanes past the not-yet-joined
+// socket AND the on-join refreshScrollback already ran, so the own
+// line never renders. Unlike a channel, a query window has NO
+// self-JOIN line to `selectChannel`-await; this seam is the
+// pre-event signal (marker-target-window T1/T2).
+export async function waitForQueryWindowReady(page, networkSlug, targetNick) {
+    await page.waitForFunction((key) => {
+        const set = window
+            .__cic_queryWindowReady;
+        return set?.has(key) === true;
+    }, `${networkSlug}/${targetNick}`, { timeout: 5_000 });
+}
+// Mirror of `cicchetto/src/lib/channelKey.ts:canonicalChannel` — the e2e tree
+// MIRRORS src rather than importing its VALUES, to keep the runner's runtime
+// graph free of the app's (see the header of fixtures/grappaApi.ts, and
+// fixtures/push.ts). "Never imports it" is what this comment said until #1646
+// and it is not true: grappaApi.ts type-imports from `src/lib/wireTypes`, a
+// plain relative import that resolves and typechecks under e2e/tsconfig.json.
+// MUST stay byte-identical to the src twin, or the composite key this rebuilds
+// won't match the one subscribe.ts stamped into `__cic_channelReady`.
+//
+// This one is a FUNCTION, so #1646's constant pin cannot watch it — the drift
+// below was found by hand, and would be again.
+//
+// #973 — this mirror had drifted two ways and was silently rebuilding keys
+// nothing had stamped. It was still the PRE-#537 shape: sigil-gated (a nick
+// came back RAW) and folding with `toLowerCase`. The src twin folds EVERY
+// identifier — a nick as well as a channel — because bahamut folds them the
+// same way, and it folds with the byte-level `asciiFold` so non-ASCII stays
+// distinct (`#CAFÉ` ≠ `#café`, the #525 posture `toLowerCase` breaks). No
+// green spec caught it because none had yet passed a mixed-case nick through
+// these seams; the first one to try would have hung on a barrier that can
+// never fire and read as a product bug.
+function canonicalChannelName(name) {
+    return name.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+// Wait until cic's channels-loop has subscribed to a real IRC channel's
+// per-channel topic (`phx.join()` ack landed for
+// `grappa:user:{u}/network:{slug}/channel:{channelName}`). Pure test
+// seam: subscribe.ts stamps `__cic_channelReady` (a Set of the module
+// composite key `channelKey(slug, name)` = `${slug} ${canonical(name)}`)
+// in the channels-loop join `onJoinOk`. Production never reads it.
+//
+// Why: the server fastlanes the operator's OWN channel PRIVMSG echo on
+// the (slug, channel) topic SYNCHRONOUSLY on POST (server.ex
+// handle_persisting_send: persist_event → per-channel broadcast, NOT
+// upstream-gated — bahamut never echoes PRIVMSG to the sender). A spec
+// that selectChannels then IMMEDIATELY composeSends races the channel
+// subscribe — the echo fastlanes past the not-yet-joined socket, PubSub
+// has NO replay to late subscribers, and the own-echo row never renders
+// (#79 — webkit-iphone-15 5s timeout; POST 201'd + persisted, DOM row
+// absent). The self-JOIN scrollback line selectChannel awaited pre-#79 is
+// NOT a reliable pre-event signal: it is a boot-persisted row served by
+// the initial REST /messages page, so it renders before the WS join ACKs.
+// This seam is the authoritative WS-ready signal, folded into
+// selectChannel's awaitWsReady branch so EVERY channel-then-send spec is
+// race-free — not a per-spec patch.
+export async function waitForChannelReady(page, networkSlug, channelName) {
+    const key = `${networkSlug} ${canonicalChannelName(channelName)}`;
+    await page.waitForFunction((k) => {
+        const set = window.__cic_channelReady;
+        return set?.has(k) === true;
+    }, key, 
+    // 10s to match selectChannel's self-JOIN-line ceiling — a channel
+    // join ACK under bahamut fake-lag in a full-suite run can lag a few
+    // seconds. Condition-poll: instant on arrival, so the ceiling is free.
+    { timeout: 10_000 });
+}
+// Wait until cic's join-ok REST backfill (`refreshScrollback`) has COMPLETED
+// for a channel — the REST-catch-up twin of `waitForChannelReady`. Pure test
+// seam: scrollback.ts stamps `__cic_scrollbackRefreshed` (a Set of the module
+// composite key `channelKey(slug, name)`) in refreshScrollback's `finally`.
+// Production never reads it.
+//
+// Why: subscribe.ts's join-ok callback fires `void refreshScrollback` then
+// stamps `__cic_channelReady` SYNCHRONOUSLY right after — so
+// `waitForChannelReady` (and thus `selectChannel`) returns while the backfill
+// is still in flight. A spec that then acts on scroll geometry (issue168
+// send-snap, #552) races the backfill's late DOM recreation: the ref-keyed
+// <For> reset drops scrollTop → onScroll flips atBottom=false → the send-snap
+// is undone → the pane strands off the bottom. Green in isolation (the backfill
+// lands before the send), red under full-gate load (the flake #552 tracks).
+// Awaiting this seam makes the send-snap deterministic — it does NOT weaken any
+// assertion, it removes the race the assertion was silently depending on.
+export async function waitForScrollbackRefreshed(page, networkSlug, channelName) {
+    const key = `${networkSlug} ${canonicalChannelName(channelName)}`;
+    await page.waitForFunction((k) => {
+        const set = window
+            .__cic_scrollbackRefreshed;
+        return set?.has(k) === true;
+    }, key, { timeout: 10_000 });
+}
+// Wait until cic's user-topic Channel has joined (Phoenix `phx.join()`
+// `ok` ack landed for `grappa:user:{userName}`). Pure test seam:
+// userTopic.ts stamps `__cic_userTopicReady` (a `Set<userName>`) in the
+// JOIN ok handler. Production never reads it.
+//
+// Why: window_pending + join_failed events fastlane to subscribed sockets
+// only — Phoenix.PubSub doesn't replay to late subscribers. cic compose
+// `/join` triggers an HTTP POST that returns before the user-topic JOIN
+// ack lands (~45ms gap measured in suite context). When the gap is wide
+// enough, the broadcasts fire on the EMPTY subscriber list and cic never
+// receives setPending/setFailed — sidebar pseudo-row never renders,
+// asserting specs time out at `.sidebar-window-greyed`.
+//
+// Wired into loginAs() universally rather than per-spec because the race
+// affects ANY spec that compose-sends `/join` (or any compose verb that
+// produces a server-side user-topic broadcast) shortly after page-load.
+//
+// #1579 — the budget is deliberately UNCHANGED. Measured over a full 759-test
+// run, 597 satisfied barriers have a median of 18 ms and a maximum of 848 ms,
+// so 5 s is not a tight budget; the three misses in that run sat at 11.1 s,
+// 31.6 s and >65 s, and every one of them was the server failing to complete
+// the WebSocket upgrade at all. A larger number would not have converted them
+// into passes, it would only have moved the red to the next assertion — which
+// is exactly what the same stall did to `loginAs`'s own shell-ready gate in
+// that run. What the barrier lacked was not slack but a voice, so it now
+// reports the state it observed instead of a bare TimeoutError.
+export async function waitForUserTopicReady(page, userName) {
+    try {
+        await page.waitForFunction((name) => {
+            const set = window
+                .__cic_userTopicReady;
+            return set?.has(name) === true;
+        }, userName, { timeout: USER_TOPIC_BARRIER_MS });
+    }
+    catch {
+        throw new Error(await describeUserTopicTimeout(page, userName, USER_TOPIC_BARRIER_MS));
+    }
+}
+// #485 — gate on the REAL service worker before a spec mutates any
+// module-singleton PWA state (e.g. the bundle-refresh banner's
+// `serverBundleHash` signal). `registerSW` (vite-plugin-pwa autoUpdate)
+// is deferred to `window.load`, so the SW installs → activates →
+// `clients.claim()`s the page AFTER `loginAs` returns (service-worker.ts
+// does skipWaiting + clients.claim). vite-plugin-pwa's autoUpdate handler
+// fires a ONE-SHOT `window.location.reload()` on that first claim, and the
+// reload re-inits every module singleton — `serverBundleHash` back to null
+// (bundleHash.ts has NO controllerchange reset path, so the reload is the
+// only thing that wipes it). The pre-fix gate only awaited `reg.active`,
+// which resolves AT activation ≈ claim — i.e. it returned a hair BEFORE the
+// reload committed, so the spec set the singleton on the doomed pre-reload
+// page and the reload wiped it: the banner vanishes (repeat: visible then
+// detached) or never mounts (repeat: count 0), and the assert times out.
+// Latent on nginx-static serving (the SW activated before the asserts);
+// #485 made the BEAM the sole, slower origin, sliding activation into the
+// test window.
+//
+// Deterministic fix (never a sleep, assert untouched): wait for the SW to
+// CONTROL the page (past install + activate + claim), then reload ONCE
+// ourselves and wait for `load`. The reloaded page boots already under SW
+// control, so no further autoUpdate reload can fire — any PWA singleton the
+// spec sets afterwards survives. Any spec that touches PWA singleton state
+// after login MUST await this first. Callers: bundle-refresh-banner,
+// bundle-refresh-real-swap, error-banners.
+export async function awaitServiceWorkerActive(page) {
+    // Nothing to serialize on a browser without SW support.
+    if (!(await page.evaluate(() => "serviceWorker" in navigator)))
+        return;
+    // Wait until the SW controls this page — the first claim is what triggers
+    // the autoUpdate reload, so once `controller` is set the SW is guaranteed
+    // active enough that our own reload below boots controlled-from-load.
+    await page.waitForFunction(() => navigator.serviceWorker.controller !== null, null, {
+        timeout: 10_000,
+    });
+    // Neutralize the racy one-shot autoUpdate reload with a deterministic one:
+    // after this the page is stably controlled and no SW-driven reload follows.
+    await page.reload({ waitUntil: "load" });
+    await page.waitForFunction(() => navigator.serviceWorker.controller !== null, null, {
+        timeout: 10_000,
+    });
+}
+// #485 (Race-2) — the server pushes `bundle_hash` (the REAL deployed hash) on
+// EVERY user-topic join (grappa_channel `push_user_snapshot` → cic userTopic
+// `setServerBundleHash`). That push lands AFTER onJoinOk, so
+// `waitForUserTopicReady` does NOT cover it; if it arrives after a spec's
+// synthetic `setServerHash`, it overwrites the synthetic and the bundle-refresh
+// banner never mounts / mounts-then-vanishes. Any spec that drives a SYNTHETIC
+// bundle mismatch MUST await this first — call it AFTER `awaitServiceWorkerActive`
+// so the value we wait on is the SW-reload's re-join push. Once the real push
+// has landed, the spec's synthetic set is the last write and the banner is
+// stable. Reads the `serverHash()` getter added to the `__cic_bundleHash` hook.
+export async function awaitServerBundleHashPush(page) {
+    await page.waitForFunction(() => {
+        const bh = window
+            .__cic_bundleHash;
+        return bh?.serverHash?.() != null;
+    }, null, { timeout: 10_000 });
+}
+// Scrollback accessors ──────────────────────────────────────────────
+// All message rows in the currently focused window's scrollback.
+// `data-testid="scrollback-line"` is the stable hook (set in
+// ScrollbackPane.tsx — won't drift on cosmetic class renames).
+export function scrollbackLines(page) {
+    return page.locator('[data-testid="scrollback-line"]');
+}
+// One scrollback row by IRC kind (`privmsg`, `action`, `join`, ...) +
+// a match against the rendered body. Two-axis match avoids spurious
+// matches across kinds (e.g. a JOIN line carrying the same nick text).
+// `bodyMatch` is a substring (string) or a RegExp — use the latter when
+// non-contiguous tokens must match, e.g. a presence line that now
+// carries an irssi-style `[user@host]` between the nick and the verb.
+export function scrollbackLine(page, kind, bodyMatch) {
+    return page.locator(`[data-testid="scrollback-line"][data-kind="${kind}"]`, {
+        hasText: bodyMatch,
+    });
+}
+// Distance in px from the scrollback's tail, or `null` when the pane is not
+// mounted. The sentinel for a missing pane belongs at the CALL SITE, because it
+// has to point the SAME WAY as the assertion that follows — `?? 999` ahead of a
+// `toBeLessThanOrEqual`, `?? 0` ahead of a `toBeGreaterThan` — so an unmounted
+// pane fails the poll instead of satisfying it. A sentinel folded into this
+// function cannot be aligned: it serves both directions at once.
+// Returning `null` rather than throwing is also what keeps the callers'
+// `expect.poll` retrying: `pollMatcher` awaits the generator OUTSIDE the try
+// that retries (playwright 1.59.1, lib/matchers/expect.js:275), so a throw here
+// would abort the poll on the first sample instead of waiting for the mount.
+// The value is a raw float on purpose — every caller compares it against a
+// threshold, and rounding here would decide the sub-pixel band for all of them.
+export async function scrollbackDistanceFromBottom(page) {
+    return await page.evaluate(() => {
+        const el = document.querySelector('[data-testid="scrollback"]');
+        if (!el)
+            return null;
+        return el.scrollHeight - el.scrollTop - el.clientHeight;
+    });
+}
+export async function rowClearance(row) {
+    return await row.evaluate((el) => {
+        const pane = document.querySelector('[data-testid="scrollback"]');
+        if (!pane)
+            throw new Error("rowClearance: scrollback container not found");
+        const r = el.getBoundingClientRect();
+        const p = pane.getBoundingClientRect();
+        const compose = document.querySelector(".compose-box");
+        const composeTop = compose ? compose.getBoundingClientRect().top : null;
+        return {
+            rowTopPx: r.top,
+            rowBottomPx: r.bottom,
+            paneTopPx: p.top,
+            paneBottomPx: p.bottom,
+            overflowBelowPx: r.bottom - p.bottom,
+            overflowAbovePx: p.top - r.top,
+            distanceFromBottomPx: pane.scrollHeight - pane.scrollTop - pane.clientHeight,
+            composeTopPx: composeTop,
+            hiddenBehindComposePx: composeTop === null ? null : r.bottom - composeTop,
+        };
+    });
+}
+// #237 — the on-JOIN inline topic line. NOT a `scrollback-line` (it is a
+// presentational, non-message row derived from the topic store — no server
+// message id, so it never enters the unread/cursor math). Its own testid
+// keeps it out of `scrollbackLines(page)` counts while giving specs a stable
+// hook for the "topic visible in the buffer flow after join" assertion.
+export function topicJoinRow(page) {
+    return page.locator('[data-testid="topic-join-line"]');
+}
+// Compose ────────────────────────────────────────────────────────────
+export function composeTextarea(page) {
+    return page.locator(".compose-box textarea");
+}
+// Type a body into the focused window's compose textarea and submit
+// (Enter, no shift). Returns once the send has SETTLED — not merely once
+// the textarea emptied, which is a much weaker fact than it looks (see the
+// barrier below).
+//
+// Use for both regular PRIVMSG bodies AND slash-commands (`/msg`,
+// `/query`, `/join`, `/me`, etc.) — compose.ts dispatches by leading
+// `/` so the same textarea handles all kinds.
+//
+// Why fill-then-press rather than `pressSequentially`: `fill` is
+// O(1) on Playwright's side (one DOM update), `pressSequentially`
+// emits N keydown events which the Solid signal flushes between
+// every char. Both work; `fill` is faster and the spec doesn't care
+// about per-keystroke side-effects.
+export async function composeSend(page, body, opts = {}) {
+    const ta = composeTextarea(page);
+    await ta.fill(body);
+    await ta.press("Enter");
+    if (opts.expectUnmount) {
+        // UX-7-F (2026-05-22) — caller knows the command triggers a
+        // selection redirect (e.g. /disconnect parks a network and
+        // selection.ts:287-316 jumps to Home, which renders no
+        // ComposeBox). The original draft IS cleared in the
+        // composeByChannel signal — but the textarea DOM element
+        // unmounts before the post-await clear arrives, so the
+        // textarea-empty wait races against the unmount and observes
+        // either a stale value or zero/two textareas during transition.
+        // Wait for unmount instead — it's the synchronous side-effect
+        // the caller actually cares about.
+        //
+        // Reviewer MED-1: precondition was implicit (ta.fill above would
+        // throw on missing element) but make it explicit so a future
+        // caller who passes `expectUnmount: true` without first focusing
+        // a textarea-bearing window gets a sharp signal instead of a
+        // silent fast-pass on `toHaveCount(0)`.
+        await expect(ta).toHaveCount(0, { timeout: 5_000 });
+        return;
+    }
+    // The empty textarea is the DISPATCH signal, and nothing more. #904's pump
+    // calls `takeDraft` synchronously as it takes the text — before the POST is
+    // issued, on every submit, success or not — and hands the body BACK from its
+    // `finally` if the dispatch fails. On a multi-line body it is weaker still:
+    // the emptiness is a transient window between that take and the #666 drain's
+    // first residue write, after which the box refills and locks.
+    //
+    // Two specs were already paying for the difference, and both looked like
+    // flakes: #951 (reload right after the clear aborted the in-flight POST, the
+    // pump handed the body back, and #772's mirror restored a sent line) and
+    // #173 (ArrowUp right after the clear landed inside the drain, where
+    // `isDraining` refuses the recall). Same false premise, two shapes — so the
+    // barrier belongs HERE, in the seam all 200+ call sites come through, not in
+    // whichever spec notices next.
+    await expect(ta).toHaveValue("", { timeout: 5_000 });
+    // The pump's own in-flight flag, read off the surface the product already
+    // publishes it on: ComposeBox binds the submit button's `aria-busy` to
+    // `isSending(key)`, which `submit` raises before it takes the draft and drops
+    // in its `finally`. So false means the pump is done — POST settled, drain
+    // finished, queue empty — for every body shape and every arm. It cannot pass
+    // vacuously either: the flag goes up BEFORE the box empties, so "empty and
+    // not busy" is unreachable mid-flight.
+    //
+    // 30s, not the 5s above: a paced #666 drain has no fixed cadence, it fans out
+    // until the #340 token bucket refuses and then sleeps the server's
+    // retry-after (2s default, up to 5 ladders per line). A dozen-line paste
+    // legitimately takes tens of seconds under load; a stuck pump still surfaces.
+    await expect(page.locator('.compose-box button[aria-label="send message"]')).toHaveAttribute("aria-busy", "false", { timeout: 30_000 });
+}
+// Mobile members/rail-drawer OPEN primitive (#71 INC-2).
+//
+// The `.shell-members` drawer is now the permanent right rail, reachable on
+// EVERY mobile window via one of two openers depending on window kind:
+//   * channel window → TopicBar hamburger (aria-label "open members sidebar")
+//   * non-channel window (home/server/mentions/admin) → ShellChrome rail
+//     opener (☰, testid `shell-chrome-rail-opener`)
+// Exactly one of the two is rendered per window — the split is on window KIND
+// alone (#881 removed the extra `windowIsJoined` gate that used to hide the
+// hamburger, and with it every rail door, on a `:failed`/`:kicked`/`:parked`
+// channel) — so probe for the TopicBar hamburger first and fall back to the
+// rail opener. `.click()` (DevTools
+// synthetic) over `.tap()` for the same WebKit synthesis-race reason as
+// closeMembersDrawer below.
+export async function openMembersDrawer(page) {
+    const drawer = page.locator(".shell-members.open");
+    // #653/#519 — re-resolve per attempt instead of a single probe-then-click.
+    // The opener that renders depends on the focused window kind (channel →
+    // TopicBar hamburger; non-channel → rail opener), and under full-gate load a
+    // settling selection redirect (e.g. the
+    // post-PART close-watcher moving focus) can swap the focused window — and
+    // re-render the topic bar — BETWEEN the count probe and the click. The
+    // hamburger then detaches mid-click; Playwright's built-in detach-retry
+    // waits out its whole timeout for a node that has unmounted (the window is
+    // now a non-channel one with no hamburger). Looping re-picks the correct
+    // opener each attempt and absorbs the transient churn; the post-condition
+    // (`.shell-members.open` visible) stays exactly as strict, and a genuine
+    // failure still surfaces loudly when the deadline elapses. Green happy path
+    // is unchanged (one probe + click + visibility assert on the first pass).
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+        if (await drawer.isVisible().catch(() => false))
+            break;
+        try {
+            // #1073 — located by CLASS, not by accessible name. The bar itself is
+            // now shared: the channel window and the admin console both render
+            // `PaneTopBar`, and its ☰ is deliberately named differently by each host
+            // ("open members sidebar" vs "open actions") because the two doors mean
+            // different things to a screen reader. The class is what they have in
+            // common, and it is the thing this helper actually needs — the in-flow
+            // opener, whichever pane is mounted.
+            const paneHamburger = page.locator(".topic-bar-hamburger");
+            if ((await paneHamburger.count()) > 0) {
+                await paneHamburger.first().click({ timeout: 3_000 });
+            }
+            else {
+                await page.getByTestId("shell-chrome-rail-opener").click({ timeout: 3_000 });
+            }
+            await expect(drawer).toBeVisible({ timeout: 3_000 });
+            break;
+        }
+        catch (err) {
+            if (Date.now() >= deadline)
+                throw err;
+        }
+    }
+    // #653 — SETTLE the slide-in before returning. `.shell-members.open` visible
+    // is true the instant the `open` class lands, i.e. at the START of the 200ms
+    // `translateX(100%) → 0` transition (themes/default.css), not its end. Every
+    // caller's next act is a click INSIDE the drawer (the rail launcher, a member
+    // row), and Playwright's actionability does not close that window: `stable`
+    // (two consecutive animation frames with an identical box) is checked, and
+    // the hit-target interceptor verifies the target of the pointer DOWN — but
+    // mousedown and mouseup are two separate protocol round-trips and nothing
+    // re-verifies the second. If the element moves between them the two land on
+    // different nodes and WebKit synthesizes NO `click` at all (click fires on
+    // the nearest common ancestor). The handler is a synchronous signal, so a
+    // swallowed click is silent: the affordance simply never opens and the
+    // caller's assert burns its full timeout. Under full-gate CPU load that
+    // inter-message gap stretches from ~1ms to hundreds, which is exactly why
+    // this is green in isolation and red in the gate (#519, #531, #512).
+    // Waiting for the drawer to be FULLY in the viewport is the open-side mirror
+    // of openAdminConsole's `not.toBeInViewport()` close-side wait: the drawer is
+    // `position: fixed; top: 0; right: 0`, `height: var(--viewport-height)`,
+    // `* { box-sizing: border-box }` — so ratio 1 is reachable only once the
+    // transform has settled at translateX(0), the instant it stops moving under
+    // the next click. Kept OUT of the retry loop above deliberately: the openers
+    // are TOGGLES, so re-clicking on a settle failure would close the drawer we
+    // just opened. A genuine failure surfaces loudly here instead.
+    await expect(drawer).toBeInViewport({ ratio: 1, timeout: 5_000 });
+}
+// #500 — reveal the RailActions launcher menu, the SINGLE door to every rail
+// affordance (settings / archive / rooms / admin / home / themes / denoise).
+// #500 collapsed the always-expanded button column behind one launcher pinned at
+// the bottom of the rail; the buttons are not in the DOM until the launcher is
+// tapped. Viewport-aware: on mobile the rail is a collapsed drawer, so open it
+// first, then tap the launcher; on desktop the rail is always on screen, so tap
+// the launcher directly. Idempotent — a no-op if the menu is already open.
+// EVERY spec that reaches a rail action MUST go through here (directly or via
+// openArchive / openSettingsSection, which now do); tapping a rail button
+// without opening the launcher first finds nothing.
+export async function openRailMenu(page) {
+    const menu = page.locator(".rail-actions-menu");
+    if (isMobileViewport(page) && (await page.locator(".shell-members.open").count()) === 0) {
+        await openMembersDrawer(page);
+    }
+    // #653 — drive the launcher off the app's OWN state, not off a single blind
+    // click. `openMembersDrawer` now settles the slide, which removes the biggest
+    // source of late movement, but the rail keeps re-laying-out while the stores
+    // hydrate (the launcher is pinned at the bottom of a flex column whose rows
+    // are `<Show>`-gated on selection / isAdmin / presence), so a click can still
+    // be swallowed between mousedown and mouseup — see the why-comment on
+    // openMembersDrawer for the mechanism. The launcher publishes the truth we
+    // need: `aria-expanded` (RailActions.tsx) mirrors the `open()` signal the
+    // menu renders from. Re-issuing ONLY while it still reads "false" is what
+    // makes this safe on a TOGGLE — a blind retry would close a menu that opened
+    // late. This is not a longer wait for a slow render: the per-attempt assert
+    // is STRICTER than the 5s it replaces, and an app that reports expanded
+    // without mounting the menu still fails loudly at the deadline.
+    const launcher = page.getByTestId("rail-actions-launcher");
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+        try {
+            // #1040 — on HOME the rail is expanded in flow and renders NO launcher:
+            // the menu IS the rail's content, so there is no door to open. Probed
+            // here, inside the loop, and NOT once before it: the rail resolves its
+            // shape only after `selectedChannel()` hydrates, and it renders the
+            // COLLAPSED shape (launcher, no menu) in the meantime — measured on the
+            // #1048 CI traces, two DOM snapshots 128ms apart, the first with a bare
+            // launcher and the second with `.rail-actions.expanded`. A one-shot probe
+            // ahead of the loop reads that first snapshot, finds no menu, and then
+            // waits out the whole deadline on a launcher home is about to unmount.
+            // `isVisible` does not auto-wait, so it is only ever sound when something
+            // else owns the waiting — here, the loop does.
+            if (await menu.isVisible())
+                return;
+            // #752 — the timeout is what makes the deadline reachable. `getAttribute`
+            // auto-waits for the element to ATTACH, and `playwright.config.ts` sets no
+            // `actionTimeout` (default 0 = no limit), so a launcher that never mounts
+            // leaves this call neither returning nor throwing: the `catch` below is
+            // never entered and the 15s deadline is never evaluated. The loop then
+            // hangs until the whole-test timeout — 60s to 150s in the specs that raise
+            // it — and reports `getAttribute` instead of "the rail menu never opened".
+            // Every other leg of this family is already bounded (see
+            // `openMembersDrawer`: `isVisible`/`count` do not wait, click and the
+            // visibility assert carry explicit 3s); this was the divergent one, and 86
+            // spec files come through this door.
+            if ((await launcher.getAttribute("aria-expanded", { timeout: 3_000 })) === "false") {
+                await launcher.click({ timeout: 3_000 });
+            }
+            await expect(menu).toBeVisible({ timeout: 3_000 });
+            return;
+        }
+        catch (err) {
+            if (Date.now() >= deadline)
+                throw err;
+        }
+    }
+}
+// Mobile "reach the settings drawer" primitive (#71 INC-2 → #500).
+//
+// The settings cog moved out of the standalone chrome bar into the rail's
+// RailActions surface (#473), then behind the launcher menu (#500). So opening
+// settings on mobile is now: reveal the rail launcher menu (which opens the rail
+// drawer first on mobile), then tap the cog. The mobilePanel mutex swaps the
+// members drawer for the `.settings-drawer` on tap; the cog also closes the
+// launcher menu (#500).
+export async function openSettingsMobile(page) {
+    await openRailMenu(page);
+    await page.getByTestId("action-cluster-cog").click();
+    await expect(page.locator(".settings-drawer.open")).toBeVisible({ timeout: 5_000 });
+}
+// Open the settings drawer (viewport-aware) and navigate into `section`'s
+// sub-page, returning the sub-page section locator so callers scope assertions
+// to it.
+//
+// #460 turned the drawer main page into an INDEX of nav rows: a control that
+// used to be inline (a push toggle, the timestamp format, the identity card)
+// now lives one tap deeper, behind its `<section>-settings-entry` row. This is
+// the SINGLE door every spec uses to reach a settings control — never
+// hand-roll the open-then-navigate, or the next IA reshuffle (like #460)
+// silently breaks every copy at once.
+//
+// The cog (aria-label "open settings" / action-cluster-cog) lives behind the
+// rail's RailActions launcher (#500): `openRailMenu` reveals the menu
+// (viewport-aware — it opens the rail drawer first on mobile), then the cog is
+// tapped. Re-navigating an already-open drawer is a no-op on the open step and
+// assumes it is on the main index.
+export async function openSettingsSection(page, section) {
+    if ((await page.locator(".settings-drawer.open").count()) === 0) {
+        await openRailMenu(page);
+        await page.getByTestId("action-cluster-cog").click();
+        await expect(page.locator(".settings-drawer.open")).toBeVisible({ timeout: 5_000 });
+    }
+    await page.getByTestId(`${section}-settings-entry`).click();
+    const subpage = page.getByTestId(`${section}-subpage`);
+    await expect(subpage).toBeVisible({ timeout: 10_000 });
+    return subpage;
+}
+// #500 — open the settings drawer ROOT (viewport-aware), returning the drawer
+// dialog locator. The sibling of openSettingsSection for specs that need the
+// drawer's main index itself — to reach a main-page affordance (the share entry,
+// delete account) or to assert drawer chrome. (#986 — reaching the ADMIN
+// console is no longer one of those reasons: use openAdminConsole, which goes
+// through the rail.) The cog (aria-label "open settings" /
+// action-cluster-cog) now lives behind the RailActions launcher (#500):
+// openRailMenu reveals the menu (opening the rail drawer first on mobile), then
+// the cog is tapped. Idempotent — the open step is a no-op if the drawer is
+// already open. This is the SINGLE door to the drawer root; never hand-roll
+// `getByLabel(/open settings/i).click()`, or the next rail reshuffle breaks
+// every copy at once (exactly the #500 regression).
+export async function openSettingsDrawer(page) {
+    if ((await page.locator(".settings-drawer.open").count()) === 0) {
+        await openRailMenu(page);
+        await page.getByTestId("action-cluster-cog").click();
+        await expect(page.locator(".settings-drawer.open")).toBeVisible({ timeout: 5_000 });
+    }
+    return page.getByRole("dialog", { name: /settings/i });
+}
+// Open the admin console — the SINGLE door for reaching AdminPane.
+//
+// #986 — that door is now the rail's 🔧 admin launcher, not the settings
+// drawer. The drawer's "admin console" entry was an exact duplicate of it
+// (same isAdmin() gate, same setSelectedChannel({kind:"admin"}) payload) and
+// was removed along with its `onOpenAdmin` prop; every spec that used to
+// hand-roll `admin-console-entry` .click() now comes through here.
+//
+// The route through the rail also RETIRES the flake this helper was written
+// to absorb. Reaching admin via the drawer meant clicking an entry that
+// closed the drawer, and `.settings-drawer` slides out over a 200ms
+// `transform` at z-index 100 anchored right — so a caller that clicked a
+// right-side admin tab (Settings is the 9th of 10) the instant `admin-pane`
+// mounted could land the click on the STILL-SLIDING drawer. That is why the
+// old body waited for `not.toBeInViewport()` before returning. The rail
+// launcher opens no drawer at all: `openAdminPanel` closes members +
+// settings + archive and sets selection, so there is nothing left mid-
+// transition over the tabs. (Surfaced as a ~9% flake once #508's iOS font
+// floor perturbed the layout timing; the pre-#986 mitigation is now
+// structural.)
+//
+// Returns the admin-pane locator so callers scope assertions to it.
+export async function openAdminConsole(page) {
+    await openRailMenu(page);
+    await page.getByTestId("mobile-panel-admin").click();
+    const pane = page.getByTestId("admin-pane");
+    await expect(pane).toBeVisible({ timeout: 10_000 });
+    return pane;
+}
+// Open the unified admin Sessions tab (#1157) — the single door for every
+// spec that used to reach EITHER the Sessions tab or the deleted Visitors tab.
+export async function openAdminSessionsTab(page) {
+    await openAdminConsole(page);
+    await page.getByTestId("admin-tab-sessions").click();
+    const table = page.getByTestId("admin-sessions-table");
+    await expect(table).toBeVisible({ timeout: 10_000 });
+    return table;
+}
+// #1224 — the ended-sessions sub-page, reached the only way an operator can:
+// through the Sessions tab's card header. Deliberately NOT routed through
+// `openAdminSessionsTab`: that one waits on `admin-sessions-table`, which does
+// not render when the live list is empty, and an empty live list is exactly
+// when a spec is most likely to be looking for a session that is over. The
+// door itself is the barrier — it renders as soon as the tab's data loads.
+// Idempotent about how it got there: a spec that already opened the Sessions
+// tab must not be sent back through the rail launcher, which is a TOGGLE and
+// would close the pane it is standing in.
+export async function openAdminEndedSessions(page) {
+    const door = page.getByTestId("admin-sessions-ended-open");
+    if ((await door.count()) === 0) {
+        await openAdminConsole(page);
+        await page.getByTestId("admin-tab-sessions").click();
+    }
+    await door.click({ timeout: 15_000 });
+    const subpage = page.getByTestId("admin-ended-sessions-page");
+    await expect(subpage).toBeVisible({ timeout: 10_000 });
+    return subpage;
+}
+// A row's testid suffix is the composite `<kind>:<subject_id>:<network_id>` —
+// the same string the `/admin/sessions/:id/*` verbs parse. A spec knows the
+// subject id (a minted visitor id, a seeded user id) but not the network's
+// integer FK, so rows are located by the two-thirds prefix and the full key is
+// read back off the DOM for the sibling controls that need it.
+export function adminSessionRows(page, kind, subjectId) {
+    return page.locator(`[data-testid^="admin-session-row-${kind}:${subjectId}:"]`);
+}
+// Resolve the ONE row of a subject that is bound to a single network, and
+// return its composite key. Fails loudly on 0 or >1 matches rather than
+// silently taking `.first()`: a caller asking for "the" row of a multi-network
+// subject is asking the wrong question, and answering it arbitrarily would
+// make a destructive verb hit a network the spec never named.
+export async function adminSessionRowKey(page, kind, subjectId) {
+    const rows = adminSessionRows(page, kind, subjectId);
+    await expect(rows).toHaveCount(1, { timeout: 15_000 });
+    const testId = await rows.getAttribute("data-testid");
+    if (testId === null)
+        throw new Error(`admin session row for ${kind}:${subjectId} lost its testid`);
+    return testId.replace("admin-session-row-", "");
+}
+// Expand a row's drill-down and return the detail panel. The disclosure is the
+// row's identity cell (`AdminRowName`), so this is also the whole-cell tap
+// target the dictation asks for.
+export async function openAdminSessionDetail(page, key) {
+    await page.getByTestId(`admin-session-details-${key}`).click();
+    const detail = page.getByTestId(`admin-session-detail-${key}`);
+    await expect(detail).toBeVisible({ timeout: 5_000 });
+    return detail;
+}
+// Close the settings drawer from ANY page — the exit counterpart to
+// openSettingsSection. #460 moved the "done" footer button onto the main index
+// only, so a spec sitting on a sub-page (where openSettingsSection leaves it)
+// can no longer reach it. The header × (settings-drawer-close) fires the SAME
+// onClose verb as "done" and is rendered on every page, so it is the one close
+// door. Owning the exit here — not re-deriving it in each spec — keeps the next
+// IA reshuffle a one-line change, the same reason the open path is centralized.
+export async function closeSettings(page) {
+    const drawer = page.getByRole("dialog", { name: /settings/i });
+    await page.getByTestId("settings-drawer-close").click();
+    // Twin of openAdminConsole's wait: the drawer stays MOUNTED and closing only
+    // strips `.open`, which STARTS a 200ms translateX(100%) slide — so waiting on
+    // `.settings-drawer.open` count→0 returns at the slide's START, the drawer
+    // still on-screen and click-intercepting. Wait until it has slid fully OUT of
+    // the viewport (transition settled), the instant it can no longer eat the
+    // next click. (toBeHidden never fires — an off-screen transform is still
+    // "visible" to Playwright.)
+    await expect(drawer).not.toBeInViewport({ timeout: 5_000 });
+}
+// Mobile members-drawer close primitive.
+//
+// `.shell-drawer-backdrop` is `position: fixed; inset: 0` (full
+// viewport) but `.shell-members.open` renders on top of it at
+// `width: 80vw` anchored right (z-index 90 vs backdrop 89). The
+// default `tap()` / `click()` targets element center → viewport
+// center → covered by the drawer → `members-pane` intercepts pointer
+// events. Pin the click to the visible left strip (x:20 is well
+// inside the ~79px-wide strip on iPhone 15 393×659) so it lands on
+// the backdrop's `setMembersOpen(false)` onClick handler.
+//
+// Why `.click()` not `.tap()`: Playwright `tap()` issues
+// touchstart/touchend and relies on engine-side click synthesis,
+// which is timing-flaky on WebKit. `.click()` fires the synthetic
+// click directly via DevTools — same end-state effect, no synthesis
+// race. Verified across UX-6-A scroll spec + UX-4-Z journey spec.
+// #1336 (#1155) — the wait is `not.toBeInViewport` on the drawer ITSELF, not
+// `.shell-members.open` count→0. Same idiom, same reason, as `closeSettings`
+// above: the drawer stays MOUNTED and closing only strips `.open`, which
+// STARTS a 200ms `transform: translateX(100%)` slide (`default.css` ~:7469),
+// so the class is gone at the slide's BEGINNING and the panel keeps covering
+// the tap point for the rest of it.
+//
+// Measured on `ux-5-bt-narrow-chrome-compression.spec.ts:124`
+// (webkit-iphone-15, run 31325751959 attempt 2 — the same sha passed on
+// attempt 1, `workers: 1`, `retries: 0`): class gone at 18:17:56.09, the next
+// tap dispatched at 18:17:56.297 at (355, 31) — inside the drawer's 288px box
+// on a 393px viewport — and 10 ms later the SERVER logged
+// `HANDLED open_query_window target_nick="m9b-grappa"`. The touch aimed at the
+// topic-bar hamburger was received by a members row, which opens a query and
+// switches focus; a DM window has no members drawer, so the assertion waited
+// out its 5 s on a `.shell-members.open` that could never exist again. The
+// barrier and the hazard are the same order of magnitude — ~196 ms of driver
+// latency against a 200 ms animation — so the margin is zero by construction.
+//
+// CORRECTED (#1155, 2026-08-19). This used to read "Playwright cannot see this
+// on its own: its 'visible, enabled and stable' check runs on the TARGET's box,
+// and the hamburger never moves." That named THREE of Playwright's four
+// actionability checks and concluded blindness from the three. The fourth —
+// "receives events" — is precisely the one that sees an overlay, and it is
+// active for `tap`: `dom.js` builds the interceptor with `actionType` `"tap"`,
+// an interception is a RETRY (`hitTargetDescription … intercepts pointer
+// events`, then `continue`) rather than a failure, and the tap interceptor
+// covers touch (`pointerdown/pointerup/touchstart/touchend/touchcancel`).
+// `force: true` is what skips it.
+//
+// MEASURED on the settings arm (n=25, in-page probe, webkit-iphone-15), where
+// L = tap-lands − class-barrier-stamp and H = point-clears − the same stamp:
+// L does not sit at a fixed driver latency, it TRACKS H (L−H median 106 ms,
+// minimum within one rAF frame), and inserting a deliberate 400 ms before the
+// tap does NOT add to L (451 ms, not 265+400) because L already contained the
+// wait for H. So on a plain locator tap the driver HOLDS the gesture until the
+// panel stops intercepting it — it is not merely slow.
+//
+// The consequence for this fixture: on a plain-locator caller the geometry
+// barrier is belt-and-braces, not the thing standing between the suite and the
+// bug. It stays because it is the honest statement of what "closed" means, and
+// because the protection it duplicates is the DRIVER's, not ours — a `force`
+// gesture withdraws it entirely (measured on `push.ts:664`: a `force` centre
+// click lands inside the drawer box, 3/3).
+//
+// STILL UNEXPLAINED, deliberately not papered over: the incident recorded
+// above shows a tap that DID land on a members row. With the hit-target check active and
+// covering touch, that should have retried instead. Nothing read so far
+// accounts for it; the class barrier's own unsoundness does not depend on the
+// answer, but the answer is not known.
+//
+// Every caller is a mobile `@webkit` spec, which is what makes the viewport
+// test meaningful: on desktop `.shell-members` is the permanent rail and never
+// leaves the viewport. That is not a new constraint — the backdrop this clicks
+// exists only on mobile.
+//
+// MEASURED, webkit-iphone-15, 10/10 repeats, clocked from the backdrop click
+// (untracked probe: a rAF sampler armed BEFORE the click recording the drawer's
+// `getBoundingClientRect().left`, its `getAnimations().length` and the `.open`
+// class, against a driver-side stamp of when the barrier returned):
+//
+//   * `.open` disappears at t = 44–67 ms;
+//   * the drawer's box is fully past the right edge at t = 238–263 ms, and the
+//     transition reports finished at t = 254–285 ms;
+//   * this barrier returns at t = 441–490 ms.
+//
+// So the margin between "the barrier lets go" and "the drawer stops covering
+// the tap point" is −207…−193 ms on the class (ALWAYS negative — the caller is
+// free to tap while the panel is still over it, and only the driver's own
+// ~200 ms of latency usually covered the gap, which is exactly why the same sha
+// passed and failed) and +193…+230 ms here (always positive).
+//
+// The #1050 worry does not materialise: `getBoundingClientRect` was measured
+// there reporting the settled transform early, and IntersectionObserver could
+// have done the same. It does not — but note what is and is not proven. The
+// 441–490 ms is when the ASSERTION RETURNED, which is an upper bound on when
+// its condition was satisfied; the IO callback itself was not instrumented. The
+// claim earned here is operational, and it is the one that matters: the
+// earliest a caller can act is ~178 ms after the drawer is provably clear.
+export async function closeMembersDrawer(page) {
+    await page.locator(".shell-drawer-backdrop.open").click({ position: { x: 20, y: 200 } });
+    await expect(page.locator(".shell-members")).not.toBeInViewport({ timeout: 5_000 });
+}
+// #473 — reach the grouped ArchiveModal (viewport-aware), the SINGLE archive
+// door on both form factors. Supersedes the three retired openers: the desktop
+// Sidebar `<details class="sidebar-archive">`, the mobile
+// `.mobile-panel-actions` footer chip, and the ShellChrome
+// `shell-chrome-archive` button. The archive button (mobile-panel-archive)
+// lives behind the RailActions launcher (#500): `openRailMenu` reveals the menu
+// (viewport-aware — opens the rail drawer first on mobile), then the archive
+// button is tapped. The button is always shown (not selection-gated), so this
+// works on every window kind including home/admin/mentions. Returns the modal
+// dialog locator so callers scope assertions to it. Re-opening an already-open
+// modal is a no-op.
+export async function openArchive(page) {
+    if ((await page.locator(".archive-modal").count()) === 0) {
+        await openRailMenu(page);
+        await page.getByTestId("mobile-panel-archive").click();
+    }
+    const modal = page.locator(".archive-modal");
+    await expect(modal).toBeVisible({ timeout: 5_000 });
+    return modal;
+}
+// #473 — expand a network's collapsible archive group inside the modal,
+// triggering its lazy row load (the `<details onToggle>` fires
+// loadArchive(slug)). Mirrors the retired Sidebar `<details>` expand. Returns
+// the `<details>` group locator so callers scope row/delete assertions to it.
+export async function expandArchiveGroup(page, networkSlug) {
+    const group = page.getByTestId(`archive-modal-group-${networkSlug}`);
+    await expect(group).toBeVisible({ timeout: 5_000 });
+    await group.locator("summary.archive-modal-group-summary").click();
+    await expect(group).toHaveAttribute("open", "");
+    return group;
+}
+// #473 — close the grouped ArchiveModal via its header × (the production
+// close affordance). A caller that interacts with the shell beneath the
+// modal (sidebar, scrollback, compose) MUST close first: the modal
+// backdrop (`.archive-modal-backdrop`) is a full-viewport scrim that
+// intercepts pointer events, so a click on anything under it hangs until
+// the test timeout. Waits for the modal to leave the DOM so the following
+// action isn't blocked by a lingering backdrop. No-op if already closed.
+export async function closeArchive(page) {
+    const modal = page.locator(".archive-modal");
+    if ((await modal.count()) === 0)
+        return;
+    await page.locator(".archive-modal-close").click();
+    await expect(modal).toHaveCount(0, { timeout: 5_000 });
+}
+// Dispatch a synthetic touch drag on `.compose-box textarea` from
+// (startX,startY) to (endX,endY). When `slowMs` > 0 a real delay separates
+// touchstart from touchmove/touchend so the ComposeBox handler's
+// performance.now() diff crosses the velocity threshold (#123). Coordinates
+// are arbitrary client px — dispatchEvent fires on the element regardless of
+// hit-testing. Chromium supports the TouchEvent constructor; WebKit's is
+// unreliable, so gesture specs using this run untagged (chromium). Shared by
+// the #123 velocity/handoff spec and the #173 recall-caret spec.
+export async function synthSwipe(page, args) {
+    await page.evaluate(async ({ startX, startY, endX, endY, slowMs }) => {
+        const ta = document.querySelector(".compose-box textarea");
+        if (!(ta instanceof HTMLTextAreaElement))
+            throw new Error("compose textarea not found");
+        const touch = (x, y) => new Touch({ identifier: 1, target: ta, clientX: x, clientY: y });
+        const fire = (type, x, y) => {
+            const t = touch(x, y);
+            const ended = type === "touchend";
+            ta.dispatchEvent(new TouchEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                touches: ended ? [] : [t],
+                targetTouches: ended ? [] : [t],
+                changedTouches: [t],
+            }));
+        };
+        fire("touchstart", startX, startY);
+        if (slowMs > 0)
+            await new Promise((r) => setTimeout(r, slowMs));
+        fire("touchmove", endX, endY);
+        fire("touchend", endX, endY);
+    }, args);
+}
+export async function composeCaretGeometry(page) {
+    return await composeTextarea(page).evaluate((el) => ({
+        selStart: el.selectionStart,
+        selEnd: el.selectionEnd,
+        valueLen: el.value.length,
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+    }));
+}
+// The oracle shared by every "caret at the end, and visible" door: #173's
+// history recall and #1105's reply quote both route through
+// `lib/composeCaret.placeCaretAtEndInView`, so they are owed the same proof
+// and must not carry two drifting copies of it — the production duplication
+// is exactly what let #1105 ship.
+//
+// `minOverflowPx` is REQUIRED and per-caller on purpose: it is the guard
+// against a vacuous pass. A draft that does not overflow the rows=1 textarea
+// sits at scrollTop 0 legitimately, so without it "the caret is in view" is
+// true for the wrong reason. Each caller states how much overflow its own
+// fixture is expected to produce, rather than inheriting a number that
+// silently stops being true.
+export function expectEndCaretVisible(g, minOverflowPx) {
+    expect(g.scrollHeight).toBeGreaterThan(g.clientHeight + minOverflowPx);
+    expect(g.selStart).toBe(g.valueLen);
+    expect(g.selEnd).toBe(g.valueLen);
+    // The defect: scrollTop left at 0 hides the end-caret. Fixed: scrolled to
+    // the bottom, so the caret's line is within [scrollTop, +clientHeight].
+    expect(g.scrollTop).toBeGreaterThan(0);
+    expect(g.scrollTop).toBeGreaterThanOrEqual(g.scrollHeight - g.clientHeight - 2);
+}
+// #902 — the inbound-INVITE banner, the surface that replaced the greyed
+// `:invited` pseudo-row.
+//
+// `data-banner-id` is the per-ENTRY identity from `lib/errorBanners.ts`
+// (`invite:<networkSlug>:<channel>`), NOT `data-source` — a source-level
+// locator would match any of N stacked invites, and telling them apart is
+// the whole point of keying the registry per entry.
+//
+// This is also the suite's observation of `windowStateByChannel`. The banner
+// is derived straight off that map (`windowState.invitedWindows`), so once
+// this locator is visible the key is provably IN the map — the property
+// `issue30-channel-tab-completion` needs as its synchronisation barrier, and
+// which the pseudo-row used to supply. A sidebar row for a JOINED channel
+// comes from `channelsBySlug` on the user topic instead, with no cross-topic
+// ordering guarantee (Sidebar.tsx), so it cannot serve the same purpose.
+export function inviteBanner(page, networkSlug, channelName) {
+    return page.locator(`.error-banner[data-banner-id="invite:${networkSlug}:${channelName}"]`);
+}
+// The [Join] action inside a specific invite banner. Scoped to the banner so
+// a second stacked invite's button can never be clicked by mistake.
+export function inviteBannerJoin(page, networkSlug, channelName) {
+    return inviteBanner(page, networkSlug, channelName).locator(".error-banner-action");
+}
+// The × on a specific invite banner. Session-scoped by design (#902): it
+// hides the banner without joining and writes nothing, so the invite comes
+// back after a reload.
+export function inviteBannerDismiss(page, networkSlug, channelName) {
+    return inviteBanner(page, networkSlug, channelName).locator(".error-banner-dismiss");
+}
+// ---------------------------------------------------------------------------
+// Computed colours (#1078)
+//
+// Compare computed colours as OPAQUE STRINGS. Never parse them with an
+// `/^rgba?\(/` regex and never assume a channel tuple: nick-palette buckets
+// 16..31 are declared as `color-mix(in oklab, …)` (themes/default.css, #444),
+// which Chrome serialises as `oklab(L a b)` — a legitimate, fully-resolved
+// colour that no `rgb(` oracle can read. Before #1078 every spec ran as one
+// fixed nick that happened to hash into 0..15, so the derived band was
+// unreachable and the regex looked total; the per-spec subject made it
+// reachable and the regex started reporting "no colour" for a correctly
+// coloured nick. Two computed values are equal iff their serialisations are
+// equal, which is all a colour assertion here needs.
+// ---------------------------------------------------------------------------
+// The browser's computed `color` for an element, verbatim.
+export function computedColor(locator) {
+    return locator.evaluate((el) => getComputedStyle(el).color);
+}
+// Resolve a CSS <color> (`var(--nick-color-19)`, `var(--fg)`, …) through the
+// LIVE cascade and return the browser's computed serialisation of it.
+//
+// A detached probe span is appended to <body> so it inherits the same
+// `:root` custom properties the real node does, read, then removed. This is
+// the only way to answer "what does this var actually resolve to" — jsdom is
+// cascade-blind, so it cannot be asked in a unit test.
+export function resolveCssColor(page, value) {
+    return page.evaluate((cssValue) => {
+        const probe = document.createElement("span");
+        probe.style.color = cssValue;
+        document.body.appendChild(probe);
+        const resolved = getComputedStyle(probe).color;
+        probe.remove();
+        return resolved;
+    }, value);
+}
+// The `var(--nick-color-N)` a NickText span declares inline. Throws rather
+// than returning null: every caller asserts against it, and a silent null
+// would turn the comparison into a tautology.
+export async function inlineNickColorVar(locator) {
+    const style = await locator.getAttribute("style");
+    const match = style?.match(/var\(--nick-color-\d+\)/);
+    if (!match) {
+        throw new Error(`expected an inline nick-colour var on the span, got style=${String(style)}`);
+    }
+    return match[0];
+}
+// #1336 — move the scrollback with a wheel gesture that has demonstrably
+// LANDED before the caller moves on.
+//
+// `page.mouse.wheel()` resolves before the scroll is applied (measured: the
+// pane still read its pre-gesture `scrollTop` immediately after the call, and
+// moved ~250 ms later), so a spec that wheels and reads in one breath asserts
+// about a pane nobody has moved yet — and the scroll then lands inside the
+// NEXT step. The gesture core (`scrollGesture.ts`, unit-tested without a
+// testnet) owns the hover → wheel → moved-and-held wait and REJECTS both a
+// gesture that never landed and one still in flight.
+//
+// `deltaY` carries the DOM's own sign convention: NEGATIVE scrolls up.
+// Sampling every 50 ms: two agreeing samples then mean the pane has held
+// still for 50 ms, which chromium's wheel animation (hundreds of ms of
+// continuous travel, measured) does not do mid-flight.
+export async function pageScrollbackBy(page, deltaY, timeoutMs) {
+    const pane = page.locator('[data-testid="scrollback"]');
+    return await scrollByGesture({
+        hover: () => pane.hover(),
+        wheel: async (delta) => await page.mouse.wheel(0, delta),
+        scrollTop: () => pane.evaluate((el) => el.scrollTop),
+    }, { deltaY, timeoutMs, pollMs: 50 });
+}
+// `pixels` is the distance to travel UP, positive, so the call site reads as
+// the operator's intent rather than as a DOM sign.
+export async function pageScrollbackUp(page, pixels, timeoutMs) {
+    return await pageScrollbackBy(page, -pixels, timeoutMs);
+}
+// #1336 S2 — the same wait with no gesture in front of it: hold until the
+// pane STOPS being written to, and report where it stopped.
+//
+// For a spec that parks on the unread marker through a PROGRAMMATIC
+// activation rather than a wheel. Recorded in-page, such a switch writes
+// `scrollTop` three times — the rows recreation resetting to the top, the
+// marker jump in flight, the marker — and a "distance from the bottom is
+// large" barrier is satisfied by the FIRST of the three, which is the pane on
+// its way somewhere rather than the pane where the test means it to be.
+//
+// Sampling every 50 ms, matching `pageScrollbackBy`: two agreeing samples mean
+// the pane held still for 50 ms.
+export async function pageScrollbackRest(page, timeoutMs) {
+    const pane = page.locator('[data-testid="scrollback"]');
+    return await waitForScrollRest({ scrollTop: () => pane.evaluate((el) => el.scrollTop) }, {
+        timeoutMs,
+        pollMs: 50,
+    });
+}
+// #1336 (row #1079) — the in-page half of `scrollTrace.ts`: three channels on
+// one clock, installed before the SPA boots.
+//
+// The channels are `scroll` events, `data-follow` transitions and rows-list
+// recreations, because the freeze this row is about can happen with NO
+// scrollTop write at all (see `scrollTrace.ts` for the full argument). The
+// scroll channel is a PASSIVE listener rather than a patched setter on
+// purpose: it is the very event stream `ScrollbackPane`'s own `onScroll`
+// consumes, so the trace has exactly the fidelity of the arm under study, and
+// nothing here can perturb the timing it is trying to measure.
+export async function installScrollTrace(page) {
+    await page.addInitScript(() => {
+        const events = [];
+        const at = () => Math.round(performance.now());
+        const push = (event) => {
+            events.push(event);
+        };
+        const w = window;
+        w.__scrollTrace = {
+            events,
+            mark: (name, value) => push({ kind: "mark", t: at(), name, value }),
+        };
+        let attached = null;
+        const attach = (el) => {
+            attached = el;
+            el.addEventListener("scroll", () => push({
+                kind: "scroll",
+                t: at(),
+                scrollTop: Math.round(el.scrollTop),
+                maxScroll: Math.round(el.scrollHeight - el.clientHeight),
+            }), { passive: true });
+            new MutationObserver(() => push({ kind: "follow", t: at(), follow: el.getAttribute("data-follow") })).observe(el, { attributes: true, attributeFilter: ["data-follow"] });
+            // A rows recreation is the list DOM being rebuilt under the pane, not
+            // one row appended: only a change of the FIRST child's identity counts,
+            // or every arriving message would read as a recreation.
+            let firstRow = el.firstElementChild;
+            new MutationObserver(() => {
+                if (el.firstElementChild === firstRow)
+                    return;
+                firstRow = el.firstElementChild;
+                push({ kind: "rows", t: at() });
+            }).observe(el, { childList: true });
+        };
+        const find = () => {
+            const el = document.querySelector('[data-testid="scrollback"]');
+            if (el instanceof HTMLElement && el !== attached)
+                attach(el);
+        };
+        new MutationObserver(find).observe(document, { childList: true, subtree: true });
+        find();
+    });
+}
+export async function markScrollTrace(page, name, value) {
+    await page.evaluate(([n, v]) => window.__scrollTrace.mark(n, v), [name, value]);
+}
+export async function readScrollTrace(page) {
+    return (await page.evaluate(() => window.__scrollTrace.events));
+}
