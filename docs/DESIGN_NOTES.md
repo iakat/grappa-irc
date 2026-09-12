@@ -54295,14 +54295,22 @@ rather than crashing on a NULL. But `users.password_hash` was born NOT
 NULL (`CreateUsers`), and SQLite cannot drop a NOT NULL in place — the
 first provision died as `Exqlite.Error NOT NULL constraint failed:
 users.password_hash`, a 500 at the exact moment the gate was supposed to
-open. The rebuild migration (`AllowNullPasswordHashOnUsers`) deviates
-from the `XorFkUserSettings` precedent deliberately: `users` is the
-parent of ten ON DELETE CASCADE children, and ecto_sqlite3 runs DDL
-inside a transaction where `PRAGMA foreign_keys` is a no-op — so the
-rename-first order would have every child's REFERENCES rewritten onto
-the throwaway name (`legacy_alter_table=ON` restores no-rewrite
-semantics for the rename, and is connection state, so it works mid-
-transaction), and the copy must land before the DROP so the implicit
-`DELETE FROM` of `DROP TABLE` finds no referencing child row.
-`PRAGMA foreign_key_check` closes the migration: a rebuild that
-silently orphaned children fails loudly instead of shipping.
+open. The rebuild migration (`AllowNullPasswordHashOnUsers`) first
+followed the `XorFkUserSettings` rename dance under
+`legacy_alter_table=ON`, and that is where it died NEXT: MEASURED on the
+bundled SQLite 3.53.3, the pragma reads back 1 yet the RENAME still
+rewrites every child's REFERENCES onto the throwaway name while
+`PRAGMA foreign_keys=ON`, in or out of a transaction — only
+`foreign_keys=OFF` keeps the children put, and that pragma is a no-op
+mid-migration-transaction. Both e2e runs therefore shipped a schema
+whose ten CASCADE children pointed at the dropped `users_old`, and the
+first `INSERT INTO sessions` answered `no such table: main.users_old`.
+The cure is the V7 precedent (`VisitorsExpiresAtNullable`): the
+sqlite-documented `PRAGMA writable_schema` REPLACE of the column text in
+`sqlite_master` — no child touched, no row moved, no FK-off window —
+plus ONE addition V7 never needed: an explicit `PRAGMA schema_version`
+bump, because a direct `sqlite_master` write does not move the schema
+cookie and `HotReload` runs the Migrator on the app's own serving pool,
+where the editing connection would keep enforcing the old NOT NULL from
+its cached schema. Pre/post-shape asserts + `foreign_key_check` +
+`integrity_check` close.
